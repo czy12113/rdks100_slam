@@ -1,0 +1,36 @@
+# pointcloud_to_laserscan 节点参数配置
+# 将Livox Mid-360S的3D点云(/livox/lidar)转换为2D激光扫描(/scan)
+# 供Cartographer 2D模式和slam_toolbox使用
+
+pointcloud_to_laserscan:
+  ros__parameters:
+    # 输入点云话题（livox_ros_driver2发布）
+    # 节点通过重映射传入，这里不配置target_frame和话题名
+
+    # 扫描帧配置
+    target_frame: "base_link"          # 投影到base_link坐标系
+    transform_tolerance: 0.05          # TF变换容忍时间(秒)
+
+    # 2D切片高度范围（从360S安装高度截取水平层）
+    # 360S安装于车体上方约0.15m处，base_link在地面
+    # 取地面以上0.05m ~ 0.5m之间的点（避免地面反射和车体遮挡）
+    min_height: 0.05                   # 最低截取高度（相对base_link，单位m）
+    max_height: 0.5                    # 最高截取高度（单位m）
+
+    # 扫描角度范围（360°全向）
+    angle_min: -3.14159265            # -180度
+    angle_max:  3.14159265            # +180度
+    angle_increment: 0.00436332       # 角度分辨率约0.25度（与LD14P相当）
+
+    # 扫描时间（匹配360S发布频率10Hz）
+    scan_time: 0.1
+
+    # 距离范围（与cartographer_2d.lua保持一致）
+    range_min: 0.1                     # 最小有效距离（m）
+    range_max: 25.0                    # 最大有效距离（m）
+
+    # 无效点处理
+    use_inf: true                      # 无效测量用inf表示（非nan）
+
+    # 浓度过滤（去除过于稀疏的点）
+    inf_epsilon: 1.0

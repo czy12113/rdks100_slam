@@ -12,7 +12,7 @@
 | IMU 姿态 | Three.js 3D 姿态展示、加速度(g)/角速度(rad/s)曲线、互补滤波姿态解算（v5.0 真实接入） |
 | 机器人控制 | 虚拟摇杆、WASD 键盘、长按/点按双模式、速度调节、急停、里程计实时显示 |
 | 目标检测 | YOLOv5 目标检测 + D435i 深度测距，带框+距离标注视频推送（v6.0 新增） |
-| SLAM 建图 | 占据栅格地图、轨迹、地图保存/加载 |
+| SLAM 建图 | Cartographer 2D/3D 建图（v7.0 真实接入）、占据栅格地图、轨迹、地图保存/加载 |
 | 导航规划 | Nav2 目标点设置、多点巡逻（预留） |
 | 设备管理 | 设备信息、传感器状态、参数配置 |
 
@@ -53,10 +53,24 @@ rdks100_slam/
 │       ├── d435i_detection/       # YOLOv5 目标检测+深度测距（v6.0 新增）
 │       │   ├── d435i_detection/detection_node.py  # 核心检测节点（双缓冲+独立推理线程）
 │       │   └── launch/detection.launch.py          # 一键启动相机+检测
-│       └── czybot_navigation2/    # 机器人运动控制（STM32 串口桥接 + 终端键盘控制）
-│           └── scripts/
-│               ├── stm32_bridge.py           # STM32 串口桥接节点（三层防抖）
-│               └── ackermann_teleop_key.py   # 终端键盘遥控（select 非阻塞读取）
+│       ├── czybot_navigation2/    # 机器人运动控制（STM32 串口桥接 + 终端键盘控制）
+│       │   └── scripts/
+│       │       ├── stm32_bridge.py           # STM32 串口桥接节点（三层防抖）
+│       │       └── ackermann_teleop_key.py   # 终端键盘遥控（select 非阻塞读取）
+│       └── czybot_slam/           # Cartographer SLAM 建图（v7.0 新增）
+│           ├── launch/                        # 3 种启动文件（2D/3D/slam_toolbox）
+│           │   ├── cartographer_2d_slam.launch.py
+│           │   ├── cartographer_3d_slam.launch.py
+│           │   └── slam_toolbox_mapping.launch.py
+│           ├── config/                        # 参数配置
+│           │   ├── cartographer_2d.lua / cartographer_3d.lua
+│           │   ├── pointcloud_to_laserscan.yaml
+│           │   └── slam_toolbox_params.yaml
+│           ├── scripts/
+│           │   ├── scan_dedup.py              # LaserScan 时间戳去重节点
+│           │   └── save_map.sh                # 地图保存脚本（nav2_map_server）
+│           └── rviz/
+│               ├── slam_2d.rviz / slam_3d.rviz # RViz2 可视化配置
 ├── d435i_ros2/               # YOLOv5 源码 + 权重文件（v6.0 新增，随 deploy.sh 打包）
 ├── deploy.sh                 # 部署到 RDK 脚本
 ├── build_ros2_ws.sh          # ROS2 工作空间编译脚本
@@ -87,6 +101,13 @@ rdks100_slam/
 - 修复：`websocket_manager.py`：新增 `"video_annotated"` topic
 - `data_pusher.py`：`video_rgb` 只推纯原图；带框图像改推 `video_annotated`（无数据时不推占位帧）
 - `VideoView.vue`：`unsubAnno` 改订阅 `video_annotated`
+
+**v7.0 SLAM 建图**（`czybot_slam` 功能包）：
+
+- 实现了真实小车 odom→map 坐标系链接，Cartographer 建图 → /map → WebSocket → 前端
+- 新增 `scan_dedup.py`：修复 pointcloud_to_laserscan 重复时间戳导致 Cartographer 丢弃帧问题
+- 新增 `save_map.sh`：nav2_map_server 地图保存脚本，含 my_map 副本用于导航
+- Cartographer 2D/3D 参数已针对 Livox Mid-360S + RDK S100 优化
 
 **其他已修改文件**：
 
@@ -217,6 +238,24 @@ cd /home/sunrise/rdks100_slam/frontend
 npm run build
 # 构建产物自动输出到 backend/static/dist/
 ```
+
+### Cartographer SLAM 建图（v7.0 新增，真实 odom→map）
+
+一键启动 2D/3D Cartographer 建图（自动按时序启动所有节点）：
+
+```bash
+cd ~/rdks100_slam/ros2_ws
+source install/setup.bash
+
+# 2D 建图（推荐）
+ros2 launch czybot_slam cartographer_2d_slam.launch.py
+
+# 备选：slam_toolbox 建图（更低 CPU）
+ros2 launch czybot_slam slam_toolbox_mapping.launch.py
+```
+
+> **说明**：启动后遥控小车走动，9 秒后 RViz2 自动打开显示实时建图效果。
+> 建图完成后执行 `bash ~/rdks100_slam/ros2_ws/src/czybot_slam/scripts/save_map.sh` 保存地图。
 
 ### Livox Mid-360S 雷达驱动启动（3D 点云 + IMU 数据源）
 
@@ -449,6 +488,87 @@ ros2 launch d435i_bringup d435i_camera.launch.py
 ros2 launch d435i_detection detection.launch.py camera:=false
 ```
 
+## SLAM 建图（v7.0 新增）
+
+### 概述
+
+`czybot_slam` 功能包实现了 Cartographer SLAM 建图，支持 2D 和 3D 两种模式，以及 slam_toolbox 备选方案。核心通过 Cartographer 发布 `map→odom` TF 变换，打通了真实小车的 odom→map 坐标系。
+
+### 数据流（2D Cartographer，推荐）
+
+```
+Mid-360S → /livox/lidar (PointCloud2, 10Hz)
+  → pointcloud_to_laserscan（水平切片 0.05m~0.5m）
+    → /scan (LaserScan)
+      → scan_dedup.py（时间戳去重，丢弃重复帧）
+        → /scan_dedup
+          → cartographer_node（2D 纯激光扫描匹配 + STM32 里程计融合）
+            → cartographer_occupancy_grid_node
+              → /map (OccupancyGrid) → ros2_bridge → WebSocket → 前端 SlamView
+```
+
+### TF 树
+
+```
+map → odom          (Cartographer 发布，回环优化后更新)
+odom → base_link     (STM32 stm32_bridge 发布，轮式里程计)
+base_link → livox_frame (静态 TF，雷达安装高度 0.15m)
+```
+
+### 启动命令
+
+```bash
+cd ~/rdks100_slam/ros2_ws
+colcon build --packages-select czybot_slam
+source install/setup.bash
+
+# 方案一：Cartographer 2D（推荐，最稳定）
+ros2 launch czybot_slam cartographer_2d_slam.launch.py
+
+# 方案二：slam_toolbox（更低 CPU 占用）
+ros2 launch czybot_slam slam_toolbox_mapping.launch.py
+
+# 方案三：Cartographer 3D（需更多 CPU，可选启用 IMU）
+ros2 launch czybot_slam cartographer_3d_slam.launch.py use_imu:=true
+```
+
+> **说明**：启动文件自动按时序启动所有节点（STM32 桥接 → Livox 驱动 → 点云转换 → 去重 → Cartographer → 地图栅格 → RViz2），
+> 9 秒后 RViz2 自动打开 `/map`、`/scan_dedup`、`/submap_list` 显示。
+
+### 地图保存
+
+```bash
+# 建图完成后保存地图
+bash ~/rdks100_slam/ros2_ws/src/czybot_slam/scripts/save_map.sh
+
+# 或指定地图名称
+bash ~/rdks100_slam/ros2_ws/src/czybot_slam/scripts/save_map.sh my_lab_map
+```
+
+地图保存至 `~/rdks100_slam/my_map/`，同时自动生成 `my_map.pgm` / `my_map.yaml` 最新副本，供后续 Nav2 导航直接使用。
+
+### 关键技术修复
+
+| 问题 | 方案 |
+|------|------|
+| pointcloud_to_laserscan 连续帧输出相同时间戳，Cartographer 要求严格递增 | `scan_dedup.py`：只转发 `ts > last_ts` 的帧到 `/scan_dedup` |
+| STM32 启动延迟导致 Cartographer 报 TF 异常 | TF 超时容忍 0.3s |
+| 地面反射和车体遮挡干扰建图 | pointcloud_to_laserscan 切片高度 0.05m~0.5m |
+| 雷达安装外参 | 静态 TF base_link→livox_frame：(0, 0, 0.15) 无旋转 |
+
+### 验证
+
+```bash
+# 检查 TF 树
+ros2 run tf2_tools view_frames
+
+# 检查 /map 发布频率
+ros2 topic hz /map
+
+# 查看地图数据
+ros2 topic echo /map --once
+```
+
 ## 机器人控制说明
 
 ### 控制方式
@@ -562,7 +682,7 @@ export const LIDAR_Z_MAX = 2.0         // 高度过滤上限
 | `/livox/imu` | `sensor_msgs/Imu` | 雷达内置 IMU（v5.0 真实接入，互补滤波解算） |
 | `/scan` | `sensor_msgs/LaserScan` | 激光雷达（LD14P 兼容，已废弃） |
 | `/odom` | `nav_msgs/Odometry` | 里程计（由 STM32 桥接节点发布） |
-| `/map` | `nav_msgs/OccupancyGrid` | SLAM 地图 |
+| `/map` | `nav_msgs/OccupancyGrid` | SLAM 地图（v7.0 Cartographer 真实建图输出） |
 | `/battery_state` | `sensor_msgs/BatteryState` | 电池 |
 | `/camera/camera/color/image_raw` | `sensor_msgs/Image` | RGB 图像（v6.0 D435i 真实接入，30Hz） |
 | `/camera/camera/aligned_depth_to_color/image_raw` | `sensor_msgs/Image` | 对齐深度图像（v6.0 真实接入） |

@@ -391,6 +391,10 @@ class ROS2Bridge:
         因此使用互补滤波（加速度计 + 陀螺仪积分）估算 Roll/Pitch，
         Yaw 使用陀螺仪积分（无磁力计，存在漂移）。
         加速度单位：g（1g ≈ 9.81 m/s²）
+
+        修复 v2：
+        - 首次收到数据时用加速度计直接初始化 Roll/Pitch（避免从 0 缓慢收敛）
+        - ALPHA 降低到 0.90，加速度计权重 10%，静止时更快反映真实姿态
         """
         import math
         import time
@@ -409,7 +413,6 @@ class ROS2Bridge:
         # 防止 dt 异常（重启/跳变）
         if dt <= 0 or dt > 1.0:
             dt = 0.01
-        self._imu_last_time = now
 
         # 加速度计估算 Roll/Pitch（静止时准确，运动时有噪声）
         acc_norm = math.sqrt(ax * ax + ay * ay + az * az)
@@ -421,17 +424,29 @@ class ROS2Bridge:
             acc_roll  = self._imu_roll
             acc_pitch = self._imu_pitch
 
-        # 互补滤波：0.98 陀螺仪积分 + 0.02 加速度计修正
-        # 高动态时陀螺仪主导，静止时加速度计修正漂移
-        ALPHA = 0.98
-        self._imu_roll  = ALPHA * (self._imu_roll  + gx * dt) + (1 - ALPHA) * acc_roll
-        self._imu_pitch = ALPHA * (self._imu_pitch + gy * dt) + (1 - ALPHA) * acc_pitch
-        # Yaw 纯陀螺仪积分（无磁力计，长时间会漂移）
-        self._imu_yaw  += gz * dt
+        # 首次收到 IMU 数据：用加速度计直接初始化姿态（跳过缓慢收敛过程）
+        if self._imu_last_time == 0.0:
+            self._imu_roll  = acc_roll
+            self._imu_pitch = acc_pitch
+            self._imu_yaw   = 0.0
+            self._imu_last_time = now
+            # 首帧直接返回加速度计估算值
+            roll_deg  = round(math.degrees(acc_roll),  2)
+            pitch_deg = round(math.degrees(acc_pitch), 2)
+            yaw_deg   = 0.0
+        else:
+            self._imu_last_time = now
+            # 互补滤波：0.90 陀螺仪积分 + 0.10 加速度计修正
+            # 降低 ALPHA 使加速度计有更大权重，静止时快速反映真实姿态
+            ALPHA = 0.90
+            self._imu_roll  = ALPHA * (self._imu_roll  + gx * dt) + (1 - ALPHA) * acc_roll
+            self._imu_pitch = ALPHA * (self._imu_pitch + gy * dt) + (1 - ALPHA) * acc_pitch
+            # Yaw 纯陀螺仪积分（无磁力计，长时间会漂移）
+            self._imu_yaw  += gz * dt
 
-        roll_deg  = round(math.degrees(self._imu_roll),  2)
-        pitch_deg = round(math.degrees(self._imu_pitch), 2)
-        yaw_deg   = round(math.degrees(self._imu_yaw),   2)
+            roll_deg  = round(math.degrees(self._imu_roll),  2)
+            pitch_deg = round(math.degrees(self._imu_pitch), 2)
+            yaw_deg   = round(math.degrees(self._imu_yaw),   2)
 
         return {
             "timestamp": now,

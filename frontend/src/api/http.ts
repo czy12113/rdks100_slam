@@ -3,15 +3,25 @@
 // =============================================================================
 
 import axios from 'axios'
+import type { AxiosInstance } from 'axios'
 import { API_BASE_URL } from '@/config'
 
+// 通用请求实例（较长超时，用于非实时接口）
 const http = axios.create({
   baseURL: API_BASE_URL,
   timeout: 10000,
   headers: { 'Content-Type': 'application/json' },
 })
 
-// 响应拦截器
+// 控制专用实例：适中超时（500ms），既保证实时性又容忍网络波动
+// 太短（200ms）会导致正常请求频繁超时 → _sendingInFlight 锁定时间内跳帧
+const ctrlHttp = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 500,
+  headers: { 'Content-Type': 'application/json' },
+})
+
+// 响应拦截器（通用）
 http.interceptors.response.use(
   (res) => res.data,
   (err) => {
@@ -20,13 +30,57 @@ http.interceptors.response.use(
   },
 )
 
+// 响应拦截器（控制专用，静默失败）
+ctrlHttp.interceptors.response.use(
+  (res) => res.data,
+  (err) => {
+    // 被主动取消或超时都静默
+    if (axios.isCancel(err) || err.code === 'ECONNABORTED') {
+      return Promise.reject(err)
+    }
+    console.warn('[CTRL]', err.response?.data || err.message)
+    return Promise.reject(err)
+  },
+)
+
 // =============================================================================
-// 控制 API
+// 防堆积速度请求管理器
+// 核心思路：每次发送新的速度指令时，取消上一个还在排队/传输中的请求。
+// 这确保后端永远只处理「最新的」速度值，不会有旧的高速请求堵在管道里。
+// 急停请求不参与取消链——它永远独立发送。
+// =============================================================================
+let _velAbortController: AbortController | null = null
+
+function sendVelocityRequest(linear_x: number, linear_y: number, angular_z: number) {
+  // 取消上一个还未完成的速度请求
+  if (_velAbortController) {
+    _velAbortController.abort()
+  }
+  _velAbortController = new AbortController()
+
+  return ctrlHttp.post(
+    '/api/control/velocity',
+    { linear_x, linear_y, angular_z },
+    { signal: _velAbortController.signal },
+  )
+}
+
+// 急停请求：独立 AbortController，永不被其他请求取消
+function sendStopRequest() {
+  // 先取消所有待发送的速度请求，防止排队的旧速度覆盖急停
+  if (_velAbortController) {
+    _velAbortController.abort()
+    _velAbortController = null
+  }
+  return ctrlHttp.post('/api/control/stop')
+}
+
+// =============================================================================
+// 控制 API（防堆积 + 短超时）
 // =============================================================================
 export const controlApi = {
-  setVelocity: (linear_x: number, linear_y: number, angular_z: number) =>
-    http.post('/api/control/velocity', { linear_x, linear_y, angular_z }),
-  stop: () => http.post('/api/control/stop'),
+  setVelocity: sendVelocityRequest,
+  stop: sendStopRequest,
   setMode: (mode: string) => http.post('/api/control/mode', { mode }),
   getParams: () => http.get('/api/control/params'),
 }
