@@ -16,6 +16,12 @@
 -- 硬件：RDK S100 + Livox Mid-360S（点云经pointcloud_to_laserscan转为/scan）
 -- 特点：纯激光扫描匹配建图，不依赖里程计（STM32固件静止时不发odom帧）
 -- 后续STM32固件改为固定频率发送里程计后，可将 use_odometry 改回 true
+--
+-- ⚠️ 雷达前倾安装说明（pitch=-40°）：
+--   base_link→livox_frame 的静态TF已加入 pitch=-40° 旋转补偿
+--   pointcloud_to_laserscan 在 base_link 坐标系下做切片，
+--   min_height=-1.5m / max_height=1.2m 覆盖前倾后的点云高度范围
+--   Cartographer 2D 接收的 /scan_dedup 已是正确补偿后的扫描数据，无需额外修改
 
 include "map_builder.lua"
 include "trajectory_builder.lua"

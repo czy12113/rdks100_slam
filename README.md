@@ -10,9 +10,9 @@
 | 视频监控 | RGB + 深度图像实时显示、截图、全屏（v6.0 D435i 真实相机 + YOLO 检测标注） |
 | 激光雷达 | Livox Mid-360S 3D 点云实时显示（PointCloud2） |
 | IMU 姿态 | Three.js 3D 姿态展示、加速度(g)/角速度(rad/s)曲线、互补滤波姿态解算（v5.0 真实接入） |
-| 机器人控制 | 虚拟摇杆、WASD 键盘、长按/点按双模式、速度调节、急停、里程计实时显示 |
+| 机器人控制 | 虚拟摇杆、WASD 键盘、长按/点按双模式、速度调节、急停、里程计实时显示（v8.0 流畅度+稳定性优化） |
 | 目标检测 | YOLOv5 目标检测 + D435i 深度测距，带框+距离标注视频推送（v6.0 新增） |
-| SLAM 建图 | Cartographer 2D/3D 建图（v7.0 真实接入）、占据栅格地图、轨迹、地图保存/加载 |
+| SLAM 建图 | Cartographer 2D/3D 建图（v7.0 真实接入 + v8.0 前倾40° TF 补偿）、占据栅格地图、轨迹、地图保存/加载 |
 | 导航规划 | Nav2 目标点设置、多点巡逻（预留） |
 | 设备管理 | 设备信息、传感器状态、参数配置 |
 
@@ -117,6 +117,42 @@ rdks100_slam/
 - `ros2_bridge.py`：新增 `/detection/results` 订阅 + `_parse_detection_results()`
 - `data_pusher.py`：新增 `push_detection_results()` 10Hz 推送任务
 - `requirements.txt`：`opencv-python` → `opencv-python-headless==4.9.0.80`，启用 `numpy==1.26.4`
+
+**v8.0 前端控制流畅度与稳定性优化**：
+
+- 对虚拟摇杆、WASD 键盘、长按/点按双模式的响应延迟进行了全面优化
+- 小车控制更加稳定，消除操控过程中的卡顿和指令抖动
+- WebSocket 控制指令传输优化，降低网络延迟对实时操控的影响
+
+**v8.0 Livox Mid-360S 前倾 40° 安装 TF 旋转补偿**：
+
+雷达实际安装前倾约 40°，`livox_frame` 坐标系的 X 轴朝前下方倾斜，通过修改 6 个文件在静态 TF 中加入旋转补偿，让下游所有节点（Cartographer、slam_toolbox、pointcloud_to_laserscan）都工作在正确的坐标系下。
+
+**四元数计算（pitch = -40°，绕 Y 轴，前倾为负）：**
+```
+qx = 0.0
+qy = sin(-20°) = -0.342
+qz = 0.0
+qw = cos(-20°) = 0.940
+```
+
+| 文件 | 参数 | 原值 | 新值 | 原因 |
+|------|------|------|------|------|
+| `cartographer_2d_slam.launch.py` | 静态TF四元数 | `0.0, 0.0, 0.0, 1.0` | `0.0, -0.342, 0.0, 0.940` | 补偿前倾旋转 |
+| `cartographer_3d_slam.launch.py` | 静态TF四元数 | 同上 | 同上 | 同上 |
+| `slam_toolbox_mapping.launch.py` | 静态TF四元数 | 同上 | 同上 | 同上 |
+| `pointcloud_to_laserscan.yaml` | `min_height` | `0.05` | `-1.5` | 前倾后前方3m处障碍物 z≈-1.78m，需负值才能采到 |
+| `pointcloud_to_laserscan.yaml` | `max_height` | `0.5` | `1.2` | 覆盖近距离仰视方向点云 |
+| `cartographer_2d.lua` | 注释 | — | 新增前倾补偿说明 | 文档化补偿机制 |
+| `cartographer_3d.lua` | 注释 | — | 新增前倾补偿+IMU自动旋转说明 | 文档化补偿机制 |
+
+> **说明**：
+> - launch/yaml/lua 均为资源文件，`--symlink-install` 模式下修改立即生效，无需重新编译
+> - 编译报错是 build 缓存引用了旧路径 `/home/sunrise`（环境迁移遗留问题），`rm -rf build/ install/` 后重新编译即可
+
+> **⚠ 重要标注（后续可能还原到正常状态）：**
+> - 若雷达恢复**水平安装**，需还原：3个launch文件四元数改回 `0.0, 0.0, 0.0, 1.0`；`pointcloud_to_laserscan.yaml` 的 `min_height` 改回 `0.05`、`max_height` 改回 `0.5`
+> - 若实际前倾角度不是精确 40°，调整四元数公式：`qy = sin(-angle/2)`, `qw = cos(-angle/2)`，`angle` 单位为弧度
 
 ### 新增功能一：D435i 相机 ROS2 启动包 `d435i_bringup`
 
@@ -497,8 +533,8 @@ ros2 launch d435i_detection detection.launch.py camera:=false
 ### 数据流（2D Cartographer，推荐）
 
 ```
-Mid-360S → /livox/lidar (PointCloud2, 10Hz)
-  → pointcloud_to_laserscan（水平切片 0.05m~0.5m）
+Mid-360S → /livox/lidar (PointCloud2, 10Hz, livox_frame坐标系，有40°前倾)
+  → pointcloud_to_laserscan（base_link坐标系下切片 -1.5m~1.2m，TF已补偿前倾）
     → /scan (LaserScan)
       → scan_dedup.py（时间戳去重，丢弃重复帧）
         → /scan_dedup
@@ -512,8 +548,11 @@ Mid-360S → /livox/lidar (PointCloud2, 10Hz)
 ```
 map → odom          (Cartographer 发布，回环优化后更新)
 odom → base_link     (STM32 stm32_bridge 发布，轮式里程计)
-base_link → livox_frame (静态 TF，雷达安装高度 0.15m)
+base_link → livox_frame (静态 TF，雷达安装高度 0.15m + 前倾40°旋转补偿，v8.0)
 ```
+
+> **v8.0**：雷达前倾约 40°，`base_link→livox_frame` 静态 TF 已加入 pitch=-40° 旋转补偿（四元数 `0.0, -0.342, 0.0, 0.940`），
+> 下游 Cartographer/slam_toolbox/pointcloud_to_laserscan 均工作在正确的补偿坐标系下。
 
 ### 启动命令
 
@@ -531,6 +570,9 @@ ros2 launch czybot_slam slam_toolbox_mapping.launch.py
 # 方案三：Cartographer 3D（需更多 CPU，可选启用 IMU）
 ros2 launch czybot_slam cartographer_3d_slam.launch.py use_imu:=true
 ```
+
+> **v8.0 说明**：启动文件已包含雷达前倾 40° 的 TF 旋转补偿（静态 TF 四元数 `0.0, -0.342, 0.0, 0.940`），
+> 若雷达恢复水平安装，需将 3 个 launch 文件中的四元数改回 `0.0, 0.0, 0.0, 1.0`。
 
 > **说明**：启动文件自动按时序启动所有节点（STM32 桥接 → Livox 驱动 → 点云转换 → 去重 → Cartographer → 地图栅格 → RViz2），
 > 9 秒后 RViz2 自动打开 `/map`、`/scan_dedup`、`/submap_list` 显示。
@@ -553,8 +595,9 @@ bash ~/rdks100_slam/ros2_ws/src/czybot_slam/scripts/save_map.sh my_lab_map
 |------|------|
 | pointcloud_to_laserscan 连续帧输出相同时间戳，Cartographer 要求严格递增 | `scan_dedup.py`：只转发 `ts > last_ts` 的帧到 `/scan_dedup` |
 | STM32 启动延迟导致 Cartographer 报 TF 异常 | TF 超时容忍 0.3s |
-| 地面反射和车体遮挡干扰建图 | pointcloud_to_laserscan 切片高度 0.05m~0.5m |
-| 雷达安装外参 | 静态 TF base_link→livox_frame：(0, 0, 0.15) 无旋转 |
+| 地面反射和车体遮挡干扰建图 | pointcloud_to_laserscan 切片高度 0.05m~0.5m（v8.0 前倾后调整为 -1.5m~1.2m） |
+| 雷达安装外参 | 静态 TF base_link→livox_frame：(0, 0, 0.15)（v8.0 新增前倾40°旋转补偿 qy=-0.342, qw=0.940） |
+| 雷达前倾40°导致前方障碍物点云丢失（v8.0） | 静态TF旋转补偿 + pointcloud_to_laserscan min_height→-1.5m |
 
 ### 验证
 
@@ -572,6 +615,8 @@ ros2 topic echo /map --once
 ## 机器人控制说明
 
 ### 控制方式
+
+> **v8.0**：对 WebSocket 控制指令传输进行了优化，虚拟摇杆/WASD/点按模式的响应延迟显著降低，小车操控更加流畅稳定。
 
 | 方式 | 说明 |
 |------|------|

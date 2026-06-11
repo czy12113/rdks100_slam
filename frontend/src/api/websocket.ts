@@ -86,6 +86,27 @@ class WebSocketClient {
     }
   }
 
+  /**
+   * 发送速度控制指令（WebSocket 低延迟通道）
+   * 相比 HTTP 消除了请求排队/重发延迟，是主控制通道。
+   * 返回 true 表示 WebSocket 已连接并发送成功。
+   */
+  sendCmdVel(vx: number, vy: number, wz: number): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false
+    this.ws.send(JSON.stringify({ action: 'cmd_vel', vx, vy, wz }))
+    return true
+  }
+
+  /**
+   * 通过 WebSocket 发送急停指令（双保险：同时也会触发 HTTP stop）
+   * WebSocket 通道延迟更低，HTTP 通道更可靠（有重试），两者并行。
+   */
+  sendEstop(): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false
+    this.ws.send(JSON.stringify({ action: 'estop' }))
+    return true
+  }
+
   /** 订阅指定 topic（通知后端） */
   subscribe(topic: string) {
     this.send({ action: 'subscribe', topic })

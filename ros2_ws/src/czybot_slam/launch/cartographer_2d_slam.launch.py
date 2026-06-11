@@ -118,15 +118,18 @@ def generate_launch_description():
     )
 
     # 2. 静态TF：base_link → livox_frame（立即发布）
-    # 360S安装在车体中心正上方，高度约15cm，无旋转偏移
-    # ⚠️ 根据实际安装位置调整 x/y/z 参数（单位：米）
+    # 360S安装在车体中心正上方，高度约15cm
+    # ⚠️ 雷达实际安装前倾约40°（绕Y轴旋转 pitch=-40°）
+    # 四元数计算：pitch=-40° → qx=0, qy=sin(-20°)=-0.342, qz=0, qw=cos(-20°)=0.940
+    # 若前倾角度有变化，请用以下公式重新计算：
+    #   qy = sin(pitch/2), qw = cos(pitch/2)，pitch 单位为弧度，前倾为负值
     static_tf_base_to_livox = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='static_tf_base_to_livox',
         arguments=[
-            '0.0', '0.0', '0.15',        # x y z：360S相对base_link的安装位置
-            '0.0', '0.0', '0.0', '1.0',  # qx qy qz qw：四元数，无旋转
+            '0.0', '0.0', '0.15',              # x y z：360S相对base_link的安装位置（米）
+            '0.0', '-0.342', '0.0', '0.940',   # qx qy qz qw：前倾40°（pitch=-40°）
             'base_link',
             'livox_frame'
         ],

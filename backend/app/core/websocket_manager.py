@@ -147,7 +147,16 @@ class WebSocketManager:
             logger.warning(f"[WS] 发送消息失败: {e}")
 
     async def handle_client_message(self, ws: WebSocket, raw: str):
-        """处理客户端发来的消息（订阅/取消订阅/控制指令）"""
+        """
+        处理客户端发来的消息（订阅/取消订阅/控制指令）
+
+        支持 action 类型：
+          subscribe   - 订阅 topic
+          unsubscribe - 取消订阅 topic
+          ping        - 心跳
+          cmd_vel     - 速度控制（直接转发到 ros2_bridge，零延迟）
+          estop       - 急停（发多次零速，优先级最高）
+        """
         try:
             msg = json.loads(raw)
             action = msg.get("action")
@@ -156,13 +165,69 @@ class WebSocketManager:
             if action == "subscribe" and topic:
                 await self.subscribe(ws, topic)
                 await self.send_to(ws, "system", {"type": "ack", "action": "subscribe", "topic": topic})
+
             elif action == "unsubscribe" and topic:
                 await self.unsubscribe(ws, topic)
                 await self.send_to(ws, "system", {"type": "ack", "action": "unsubscribe", "topic": topic})
+
             elif action == "ping":
                 await self.send_to(ws, "heartbeat", {"type": "pong", "ts": msg.get("ts")})
+
+            elif action == "cmd_vel":
+                # 速度控制：从 WebSocket 直接驱动 ros2_bridge，避免 HTTP 往返延迟
+                # 格式: {"action": "cmd_vel", "vx": float, "vy": float, "wz": float}
+                await self._handle_cmd_vel(msg)
+
+            elif action == "estop":
+                # 急停：连续发送零速，优先级最高
+                await self._handle_estop()
+
         except json.JSONDecodeError:
             logger.warning(f"[WS] 收到非法消息: {raw[:100]}")
+        except Exception as e:
+            logger.error(f"[WS] 处理消息异常: {e}")
+
+    async def _handle_cmd_vel(self, msg: dict):
+        """处理速度控制消息，直接发布到 ROS2"""
+        from app.services.ros2_bridge import ros2_bridge
+        from app.core.config import ROBOT_MAX_LINEAR_VEL, ROBOT_MAX_ANGULAR_VEL
+
+        try:
+            vx = float(msg.get("vx", 0.0))
+            vy = float(msg.get("vy", 0.0))
+            wz = float(msg.get("wz", 0.0))
+
+            # 硬限幅（与 HTTP 接口一致）
+            vx = max(-ROBOT_MAX_LINEAR_VEL, min(ROBOT_MAX_LINEAR_VEL, vx))
+            vy = max(-ROBOT_MAX_LINEAR_VEL, min(ROBOT_MAX_LINEAR_VEL, vy))
+            wz = max(-ROBOT_MAX_ANGULAR_VEL, min(ROBOT_MAX_ANGULAR_VEL, wz))
+
+            if ros2_bridge.is_enabled:
+                ros2_bridge.publish_cmd_vel(vx, vy, wz)
+            # 模拟模式：更新 mock 状态
+            from app.services.mock_data import mock_generator
+            mock_generator.set_velocity(vx, vy, wz)
+
+        except (ValueError, TypeError) as e:
+            logger.warning(f"[WS] cmd_vel 参数非法: {e}")
+
+    async def _handle_estop(self):
+        """急停处理：连续 5 次发送零速，确保 STM32 收到"""
+        from app.services.ros2_bridge import ros2_bridge
+        from app.services.mock_data import mock_generator
+
+        mock_generator.emergency_stop()
+
+        if ros2_bridge.is_enabled:
+            # 在线程池中执行，不阻塞事件循环
+            loop = asyncio.get_event_loop()
+            def _send_stop():
+                for _ in range(5):
+                    ros2_bridge.publish_cmd_vel(0.0, 0.0, 0.0)
+                    import time
+                    time.sleep(0.02)  # 20ms 间隔，确保串口不丢帧
+            await loop.run_in_executor(None, _send_stop)
+        logger.info("[WS] 急停指令已执行（5 帧零速）")
 
     @property
     def stats(self) -> dict:

@@ -3,7 +3,6 @@
 // =============================================================================
 
 import axios from 'axios'
-import type { AxiosInstance } from 'axios'
 import { API_BASE_URL } from '@/config'
 
 // 通用请求实例（较长超时，用于非实时接口）
@@ -13,11 +12,11 @@ const http = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
-// 控制专用实例：适中超时（500ms），既保证实时性又容忍网络波动
-// 太短（200ms）会导致正常请求频繁超时 → _sendingInFlight 锁定时间内跳帧
-const ctrlHttp = axios.create({
+// 急停专用实例：适中超时（800ms），急停必须送达，不能太短
+// 注意：速度控制已迁移到 WebSocket 通道，不再需要 ctrlHttp 发速度
+const stopHttp = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 500,
+  timeout: 800,
   headers: { 'Content-Type': 'application/json' },
 })
 
@@ -30,57 +29,64 @@ http.interceptors.response.use(
   },
 )
 
-// 响应拦截器（控制专用，静默失败）
-ctrlHttp.interceptors.response.use(
+// 响应拦截器（急停专用，静默失败但记录警告）
+stopHttp.interceptors.response.use(
   (res) => res.data,
   (err) => {
-    // 被主动取消或超时都静默
-    if (axios.isCancel(err) || err.code === 'ECONNABORTED') {
-      return Promise.reject(err)
-    }
-    console.warn('[CTRL]', err.response?.data || err.message)
+    if (axios.isCancel(err)) return Promise.reject(err)
+    console.warn('[ESTOP]', err.response?.data || err.message)
     return Promise.reject(err)
   },
 )
 
 // =============================================================================
-// 防堆积速度请求管理器
-// 核心思路：每次发送新的速度指令时，取消上一个还在排队/传输中的请求。
-// 这确保后端永远只处理「最新的」速度值，不会有旧的高速请求堵在管道里。
-// 急停请求不参与取消链——它永远独立发送。
+// 急停请求
+// 速度控制已通过 WebSocket 通道发送（wsClient.sendCmdVel），HTTP 只保留急停。
+// 急停独立通道，不受 WebSocket 速度消息影响。
+// =============================================================================
+function sendStopRequest() {
+  return stopHttp.post('/api/control/stop')
+}
+
+// =============================================================================
+// HTTP fallback 速度请求（WebSocket 不可用时使用）
+// 零速（停车）帧不使用 AbortController，确保不被后续请求取消
 // =============================================================================
 let _velAbortController: AbortController | null = null
 
 function sendVelocityRequest(linear_x: number, linear_y: number, angular_z: number) {
-  // 取消上一个还未完成的速度请求
+  const isStop = linear_x === 0 && linear_y === 0 && angular_z === 0
+
+  if (isStop) {
+    // 零速帧：独立请求，不参与 abort 链，确保停车必然到达
+    if (_velAbortController) {
+      _velAbortController.abort()
+      _velAbortController = null
+    }
+    return http.post('/api/control/velocity', { linear_x: 0, linear_y: 0, angular_z: 0 })
+  }
+
+  // 非零速：取消上一个还未完成的速度请求，防止请求堆积
   if (_velAbortController) {
     _velAbortController.abort()
   }
   _velAbortController = new AbortController()
 
-  return ctrlHttp.post(
+  return http.post(
     '/api/control/velocity',
     { linear_x, linear_y, angular_z },
-    { signal: _velAbortController.signal },
+    { signal: _velAbortController.signal, timeout: 400 },
   )
 }
 
-// 急停请求：独立 AbortController，永不被其他请求取消
-function sendStopRequest() {
-  // 先取消所有待发送的速度请求，防止排队的旧速度覆盖急停
-  if (_velAbortController) {
-    _velAbortController.abort()
-    _velAbortController = null
-  }
-  return ctrlHttp.post('/api/control/stop')
-}
-
 // =============================================================================
-// 控制 API（防堆积 + 短超时）
+// 控制 API
 // =============================================================================
 export const controlApi = {
-  setVelocity: sendVelocityRequest,
+  /** 急停（HTTP 独立通道，始终可靠送达） */
   stop: sendStopRequest,
+  /** HTTP fallback 速度控制（正常情况用 wsClient.sendCmdVel） */
+  setVelocity: sendVelocityRequest,
   setMode: (mode: string) => http.post('/api/control/mode', { mode }),
   getParams: () => http.get('/api/control/params'),
 }

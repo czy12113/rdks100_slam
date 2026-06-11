@@ -2,8 +2,8 @@
 # API 路由：机器人控制
 # =============================================================================
 
-import time
 import asyncio
+import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from app.core.config import (
@@ -14,12 +14,16 @@ from app.core.config import (
 from app.services.mock_data import mock_generator
 from app.services.ros2_bridge import ros2_bridge
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/control", tags=["control"])
 
 # -----------------------------------------------------------------------------
-# 控制状态（仅用于 mock 数据显示，不再做任何速度滤波/限幅）
-# 说明：前端已有低通滤波 + 死区处理，stm32_bridge 也有节流 + 超时保护，
-#       后端不应再叠加任何滤波，否则双重延迟导致响应卡顿、松键不停车。
+# 控制状态（仅用于 mock 数据显示）
+# 说明：主控制通道已迁移到 WebSocket（低延迟、无 HTTP 往返）。
+#       HTTP /velocity 保留为兼容 fallback，/stop 作为急停独立通道。
+#       stm32_bridge 有自己的 CMD_TIMEOUT(0.5s) + 看门狗兜底，
+#       后端不叠加任何滤波，直接透传。
 # -----------------------------------------------------------------------------
 _current_vx: float = 0.0
 _current_wz: float = 0.0
@@ -35,12 +39,13 @@ class ModeCmd(BaseModel):
     mode: str = Field(..., description="运行模式: manual / auto / navigation")
 
 
-@router.post("/velocity", summary="发送速度控制指令")
+@router.post("/velocity", summary="发送速度控制指令（HTTP fallback，主通道为 WebSocket）")
 async def set_velocity(cmd: VelocityCmd):
+    """
+    HTTP 速度控制接口（保留作 fallback）。
+    正常情况下前端通过 WebSocket cmd_vel 消息控制，延迟更低。
+    """
     global _current_vx, _current_wz
-
-    # 直接透传，不做任何斜坡/低通滤波
-    # 前端负责平滑，stm32_bridge 负责节流和超时停车
     _current_vx = cmd.linear_x
     _current_wz = cmd.angular_z
 
@@ -58,20 +63,39 @@ async def set_velocity(cmd: VelocityCmd):
     }
 
 
-@router.post("/stop", summary="急停")
+@router.post("/stop", summary="急停（HTTP 独立通道，不受 WebSocket 速度指令影响）")
 async def emergency_stop():
+    """
+    急停接口：
+    - 连续发送 5 次零速帧，间隔 20ms，确保 STM32 串口必然收到
+    - 在线程池中执行串口写入，不阻塞 asyncio 事件循环
+    - HTTP 独立通道，不会被 WebSocket 速度消息取消或覆盖
+    """
     global _current_vx, _current_wz
     _current_vx = 0.0
     _current_wz = 0.0
 
     mock_generator.emergency_stop()
 
-    # 急停：连续发送 3 次零速，确保 STM32 收到
     if ros2_bridge.is_enabled:
-        for _ in range(3):
-            ros2_bridge.publish_cmd_vel(0.0, 0.0, 0.0)
+        loop = asyncio.get_event_loop()
 
-    return {"success": True, "message": "急停指令已执行"}
+        def _send_stop_frames():
+            import time
+            for i in range(5):
+                try:
+                    ros2_bridge.publish_cmd_vel(0.0, 0.0, 0.0)
+                except Exception as e:
+                    logger.warning(f"[Control] 急停发送第 {i+1} 帧失败: {e}")
+                time.sleep(0.02)  # 20ms 间隔，与 stm32_bridge 定时器(40ms)配合
+
+        await loop.run_in_executor(None, _send_stop_frames)
+        logger.info("[Control] 急停：已发送 5 帧零速")
+    else:
+        # 模拟模式：直接返回
+        pass
+
+    return {"success": True, "message": "急停指令已执行（5 帧零速）"}
 
 
 @router.post("/mode", summary="切换运行模式")

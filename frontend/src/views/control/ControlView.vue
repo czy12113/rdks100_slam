@@ -239,6 +239,7 @@ const logRef = ref<HTMLElement>()
 const linearSpeed  = ref(ROBOT_DEFAULT_LINEAR_VEL)
 const angularSpeed = ref(ROBOT_DEFAULT_ANGULAR_VEL)
 
+// 本地显示用速度（WebSocket 有实际里程计数据时会覆盖）
 const cmdVx = ref(0)
 const cmdWz = ref(0)
 
@@ -265,7 +266,8 @@ function toggleMode() {
   targetVx = 0
   targetWz = 0
   keys.value = { w: false, a: false, s: false, d: false }
-  doSendVelocity(0, 0)
+  // 切换模式时立即发一次零速
+  sendVelNow(0, 0)
   addLog(`已切换到${tapMode.value ? '点按' : '长按'}模式`, 'info')
 }
 
@@ -300,47 +302,62 @@ function velBarClass(val: number) {
 // ── 控制参数 ──────────────────────────────────────────────────────────
 const JOYSTICK_DEADZONE = 0.08
 const JOYSTICK_SIZE     = 140
-const SEND_INTERVAL_MS  = 50     // 发送间隔 50ms（20Hz）
+/**
+ * 发送间隔 50ms（20Hz）
+ * stm32_bridge CMD_TIMEOUT=0.5s，50ms 轮询远小于超时阈值，不会触发误停车
+ */
+const SEND_INTERVAL_MS  = 50
 const DIAGONAL_SCALE    = 0.707
 
+// 目标速度（由键盘/摇杆写入，由 sendLoop 读取）
 let targetVx = 0
 let targetWz = 0
 let sendTimer: ReturnType<typeof setInterval> | null = null
 let joystickActive = false
 
-// ── 发送机制 ─────────────────────────────────────────────────────────
-// 核心设计：
-//   1. sendTimer 以 50ms 间隔触发，每次都发送（不跳帧）
-//   2. http.ts 的 AbortController 确保网络层同时只有 1 个请求在飞
-//      （新请求自动 abort 上一个未完成的，不会堆积）
-//   3. 急停和松键停车通过 controlApi.stop() 独立通道发送
-//   4. 不再使用 _sendingInFlight 互斥——它会导致跳帧过多，
-//      在网络延迟 > 50ms 时电机因收不到持续指令而被 bridge 超时归零
-let _lastSentVx = 0
-let _lastSentWz = 0
+// 上一帧已发送的速度，用于"到达零速后不再重复发零"优化
+let _sentVx = 0
+let _sentWz = 0
 
-/** 发送速度指令（每次调用都发，AbortController 防堆积） */
-function doSendVelocity(vx: number, wz: number) {
+// 急停状态标志：true 时 sendLoop 跳过，防止定时器覆盖急停
+let _estopActive = false
+
+// ── 核心发送函数 ──────────────────────────────────────────────────────
+/**
+ * 立即发送速度（主通道：WebSocket；fallback：HTTP）
+ * WebSocket 无网络往返延迟，不会有请求堆积问题。
+ * 只有 WebSocket 断开时才 fallback 到 HTTP。
+ */
+function sendVelNow(vx: number, wz: number) {
   cmdVx.value = vx
   cmdWz.value = wz
-  _lastSentVx = vx
-  _lastSentWz = wz
+  _sentVx = vx
+  _sentWz = wz
 
-  // http.ts 内部：AbortController 会先取消上一个未完成的请求
-  controlApi.setVelocity(vx, 0, wz)
-    .catch(() => { /* 被 abort 或超时都静默 */ })
+  // 优先走 WebSocket（低延迟，无堆积）
+  const sent = wsClient.sendCmdVel(vx, 0, wz)
+  if (!sent) {
+    // WebSocket 未连接：fallback 到 HTTP（静默失败）
+    controlApi.setVelocity(vx, 0, wz).catch(() => {})
+  }
 }
 
-/** 强制发送停车（通过独立的 /stop 接口） */
+/**
+ * 急停：双通道并行发送（WebSocket + HTTP），确保必然送达
+ * 不再额外调用 setVelocity(0,0,0)，避免竞态覆盖
+ */
 function doForceStop() {
   cmdVx.value = 0
   cmdWz.value = 0
-  _lastSentVx = 0
-  _lastSentWz = 0
-  // stop() 内部会先 abort 所有排队的 velocity 请求
+  _sentVx = 0
+  _sentWz = 0
+  targetVx = 0
+  targetWz = 0
+
+  // WebSocket 通道：后端发 5 帧零速
+  wsClient.sendEstop()
+  // HTTP 通道：独立请求，不受 WebSocket 状态影响（双保险）
   controlApi.stop().catch(() => {})
-  // 同时直接发一个零速，双保险
-  controlApi.setVelocity(0, 0, 0).catch(() => {})
 }
 
 // ── 摇杆 ─────────────────────────────────────────────────────────────
@@ -356,9 +373,13 @@ function initJoystick() {
     fadeTime: 100,
   })
 
-  joystick.on('start', () => { joystickActive = true })
+  joystick.on('start', () => {
+    joystickActive = true
+    _estopActive = false
+  })
 
   joystick.on('move', (_evt: any, data: any) => {
+    if (_estopActive) return
     const force = Math.min(data.force, 1)
     if (force < JOYSTICK_DEADZONE) {
       targetVx = 0
@@ -375,31 +396,40 @@ function initJoystick() {
     joystickActive = false
     targetVx = 0
     targetWz = 0
-    doForceStop()
+    // 摇杆松开：立即发零速，不等定时器下一拍
+    if (!_estopActive) {
+      sendVelNow(0, 0)
+    }
   })
 }
 
 // ── 方向按钮 ─────────────────────────────────────────────────────────
 function onDpadDown(e: PointerEvent, key: 'w' | 'a' | 's' | 'd') {
   ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+  if (_estopActive) return
   if (tapMode.value) {
     tapStep(key)
   } else {
     keys.value[key] = true
   }
 }
+
 function onDpadUp(key: 'w' | 'a' | 's' | 'd') {
   if (!tapMode.value) {
     keys.value[key] = false
     if (!keys.value.w && !keys.value.a && !keys.value.s && !keys.value.d && !joystickActive) {
       targetVx = 0
       targetWz = 0
-      doForceStop()
+      // 松键立即发零速，不等定时器
+      if (!_estopActive) {
+        sendVelNow(0, 0)
+      }
     }
   }
 }
 
 function tapStep(key: 'w' | 'a' | 's' | 'd') {
+  if (_estopActive) return
   const maxVx = ROBOT_MAX_LINEAR_VEL
   const maxWz = ROBOT_MAX_ANGULAR_VEL
   if (key === 'w') tapVx.value = Math.min(tapVx.value + TAP_VX_STEP, maxVx)
@@ -417,6 +447,8 @@ function onKeyDown(e: KeyboardEvent) {
   if (tag === 'INPUT' || tag === 'TEXTAREA') return
   const k = e.key.toLowerCase()
   if (k === ' ') { emergencyStop(); e.preventDefault(); return }
+
+  if (_estopActive) return  // 急停状态下屏蔽其他按键
 
   if (tapMode.value) {
     if (e.repeat) return
@@ -445,7 +477,9 @@ function onKeyUp(e: KeyboardEvent) {
   if (!keys.value.w && !keys.value.a && !keys.value.s && !keys.value.d && !joystickActive) {
     targetVx = 0
     targetWz = 0
-    doForceStop()
+    if (!_estopActive) {
+      sendVelNow(0, 0)
+    }
   }
 }
 
@@ -463,44 +497,66 @@ function calcKeyTarget(): { vx: number; wz: number } {
 }
 
 // ── 发送循环 ─────────────────────────────────────────────────────────
-// 设计原则：
-//   - 每 50ms 触发一次（20Hz），每次都发（AbortController 防堆积）
-//   - 停车指令通过 doForceStop() 走独立通道，不受本循环限制
+/**
+ * 50ms 定时发送（20Hz），核心设计原则：
+ *
+ * 1. 急停状态（_estopActive=true）直接跳过，防止定时器覆盖急停指令
+ * 2. 非零速时每帧都发：stm32_bridge 需要持续收到指令才能保持运动
+ *    （CMD_TIMEOUT=0.3s，50ms 远小于超时阈值）
+ * 3. 零速状态：只在"上一帧刚从非零变为零"时发一次，之后不再重复发零
+ *    （防止大量零速帧刷串口）
+ * 4. 通过 WebSocket 发送（无 HTTP 往返延迟，无请求堆积）
+ */
 function startSendLoop() {
   sendTimer = setInterval(() => {
-    // 从键盘/点按模式计算当前目标
+    // 急停状态：跳过，防止覆盖急停指令
+    if (_estopActive) return
+
+    // 更新目标速度（键盘/tap 模式）
     if (!joystickActive) {
-      if (tapMode.value) {
-        // tap 模式 targetVx/Wz 由 tapStep 写入
-      } else {
+      if (!tapMode.value) {
         const kt = calcKeyTarget()
         targetVx = kt.vx
         targetWz = kt.wz
       }
+      // tap 模式：targetVx/Wz 由 tapStep 直接写入
     }
 
-    // 仅在有有效速度时发送（零速由 doForceStop 专门处理，避免重复刷零）
-    if (targetVx === 0 && targetWz === 0) {
-      // 如果上次发送的也是零，则不再重复发
-      if (_lastSentVx === 0 && _lastSentWz === 0) return
+    if (targetVx !== 0 || targetWz !== 0) {
+      // 非零速：每帧都发，保持电机持续运转
+      sendVelNow(targetVx, targetWz)
+    } else {
+      // 目标归零：只在"刚归零"时发一次，避免重复刷零速
+      if (_sentVx !== 0 || _sentWz !== 0) {
+        sendVelNow(0, 0)
+      }
+      // 否则：已是零速，不重复发
     }
-
-    doSendVelocity(targetVx, targetWz)
   }, SEND_INTERVAL_MS)
 }
 
 // ── 急停 ─────────────────────────────────────────────────────────────
+/**
+ * 急停：
+ * 1. 设置 _estopActive 标志，阻止 sendLoop 和其他控制路径覆盖
+ * 2. 双通道并行：WebSocket（低延迟） + HTTP（可靠）
+ * 3. 300ms 后自动解除急停标志（允许下次操作）
+ *    比 stm32_bridge 看门狗超时(0.6s)短，但足够让停车帧到达
+ */
 function emergencyStop() {
-  // 立即清零所有状态
+  _estopActive = true
+
+  // 清零所有控制状态
   keys.value = { w: false, a: false, s: false, d: false }
   tapVx.value = 0
   tapWz.value = 0
-  targetVx = 0
-  targetWz = 0
   joystickActive = false
 
-  // 通过独立通道强制停车
+  // 双通道发送急停
   doForceStop()
+
+  // 300ms 后解除急停锁定（允许重新操作）
+  setTimeout(() => { _estopActive = false }, 300)
 
   addLog('急停已触发', 'warn')
   ElMessage.warning('急停已执行')
@@ -531,7 +587,8 @@ onMounted(() => {
   window.addEventListener('keyup', onKeyUp)
   startSendLoop()
   unsubOdom = wsClient.on('odom', () => {})
-  addLog('控制界面已就绪，WASD/方向键控制，空格急停', 'info')
+  addLog('控制界面已就绪（WebSocket 控制通道）', 'info')
+  addLog('WASD/方向键/摇杆控制，空格键急停', 'info')
 })
 
 onUnmounted(() => {
@@ -540,6 +597,8 @@ onUnmounted(() => {
   window.removeEventListener('keyup', onKeyUp)
   if (sendTimer) clearInterval(sendTimer)
   if (unsubOdom) unsubOdom()
+  // 离开页面：双通道发送停车
+  wsClient.sendEstop()
   controlApi.stop().catch(() => {})
 })
 </script>
