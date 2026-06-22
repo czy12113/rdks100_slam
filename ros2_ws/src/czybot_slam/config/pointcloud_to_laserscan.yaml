@@ -1,47 +1,21 @@
-# pointcloud_to_laserscan 节点参数配置
-# 将Livox Mid-360S的3D点云(/livox/lidar)转换为2D激光扫描(/scan)
-# 供Cartographer 2D模式和slam_toolbox使用
-#
-# ⚠️ 雷达前倾安装说明（pitch=-40°）：
-#   雷达安装高度 z=0.15m，前倾40°后，在 base_link 坐标系下：
-#   - 正前方远处的点云 z 坐标会大幅降低（约 0.15 - r*sin(40°)）
-#   - 例如距离5m处的点云 z ≈ 0.15 - 5*0.643 ≈ -3.06m
-#   - 因此 min_height 必须设为足够小的负值，才能采集到前方障碍物点
-#   - max_height 也需适当增大，覆盖近距离抬头方向的点云
-#   - 通过 target_frame="base_link" + TF补偿，点云已转换到base_link坐标系
-#   - 当前参数覆盖高度范围 -1.5m ~ 1.2m，适合室内2D建图场景
-
 pointcloud_to_laserscan:
   ros__parameters:
-    # 输入点云话题（livox_ros_driver2发布）
-    # 节点通过重映射传入，这里不配置target_frame和话题名
+    target_frame: "base_link"
+    transform_tolerance: 0.05
 
-    # 扫描帧配置
-    target_frame: "base_link"          # 投影到base_link坐标系（TF已含40°前倾补偿）
-    transform_tolerance: 0.05          # TF变换容忍时间(秒)
+    # Keep the 2D projection narrow. A wide vertical slice mixes floor,
+    # furniture, door frames and wall points into one LaserScan and often
+    # appears as double walls in Cartographer.
+    min_height: -0.20
+    max_height: 0.35
 
-    # 2D切片高度范围
-    # ⚠️ 雷达前倾40°后，前方障碍物点云在base_link坐标系下z值会大幅降低
-    # 例如：距离3m的墙壁点 z ≈ 0.15 - 3*sin(40°) ≈ -1.78m
-    # 因此需将 min_height 设为足够负值，才能保留前方障碍物信息
-    # max_height 设为1.2m，保留近处/头顶方向有效点
-    min_height: -1.5                   # 最低截取高度（相对base_link，需为负值覆盖前倾点云）
-    max_height: 1.2                    # 最高截取高度（覆盖近距离仰视方向点云）
-
-    # 扫描角度范围（360°全向）
-    angle_min: -3.14159265            # -180度
-    angle_max:  3.14159265            # +180度
-    angle_increment: 0.00436332       # 角度分辨率约0.25度（与LD14P相当）
-
-    # 扫描时间（匹配360S发布频率10Hz）
+    angle_min: -3.14159265
+    angle_max: 3.14159265
+    angle_increment: 0.00436332
     scan_time: 0.1
 
-    # 距离范围（与cartographer_2d.lua保持一致）
-    range_min: 0.1                     # 最小有效距离（m）
-    range_max: 25.0                    # 最大有效距离（m）
+    range_min: 0.1
+    range_max: 15.0
 
-    # 无效点处理
-    use_inf: true                      # 无效测量用inf表示（非nan）
-
-    # 浓度过滤（去除过于稀疏的点）
+    use_inf: true
     inf_epsilon: 1.0

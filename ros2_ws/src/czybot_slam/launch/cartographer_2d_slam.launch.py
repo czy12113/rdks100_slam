@@ -1,128 +1,134 @@
 #!/usr/bin/env python3
-"""
-Cartographer 2D SLAM 建图主启动文件  v2
-硬件：RDK S100 + Livox Mid-360S + STM32底盘
-
-数据流：
-  Mid-360S ──→ /livox/lidar (PointCloud2)
-                     │
-                     ▼
-       pointcloud_to_laserscan
-                     │
-                     ▼
-              /scan (LaserScan)
-                     │
-                     ▼
-           scan_dedup（时间戳修复+限速）
-                     │
-                     ▼
-              /scan_dedup (LaserScan)
-                     │
-                     ▼
-          cartographer_node (2D SLAM)
-                     │
-                     ▼
-     /map + /tf(map→odom→base_link) + /submap_list
-
-TF 树（v2，关闭外部odom）：
-  map → odom      (由Cartographer内部维护，provide_odom_frame=true)
-  odom → base_link (由Cartographer发布，published_frame="base_link")
-  base_link → livox_frame (静态TF，本文件发布)
-
-  注：STM32 stm32_bridge 仍然运行（用于接收 cmd_vel 控制小车），
-      但 publish_tf=false，不发布 odom→base_link TF，避免与
-      Cartographer 的 TF 冲突。里程计话题 /odom 仍发布供监控使用。
-
-  为什么关闭外部里程计融合（use_odometry=false）：
-      STM32里程计缺少协方差矩阵（全为0），Cartographer无法评估置信度，
-      转弯时累积误差直接注入位姿估计，导致地图重影。
-      Livox 360° 全向扫描匹配精度足够独立建图。
-
-启动时序：
-  t=0s   STM32桥接（仅收发cmd_vel，不发TF）+ 静态TF
-  t=3s   Livox Mid-360S 驱动
-  t=5s   pointcloud_to_laserscan
-  t=5.5s scan_dedup（时间戳修复）
-  t=7s   Cartographer 建图节点
-  t=8s   Cartographer 地图发布节点
-  t=9s   RViz2（此时/map和/scan都已就绪，打开即可见建图效果）
-
-用法：
-  ros2 launch czybot_slam cartographer_2d_slam.launch.py
-  ros2 launch czybot_slam cartographer_2d_slam.launch.py use_rviz:=false
-  ros2 launch czybot_slam cartographer_2d_slam.launch.py stm32_port:=/dev/ttyUSB1
-"""
 
 import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import (
-    DeclareLaunchArgument,
-    TimerAction,
-    LogInfo,
-)
+from launch.actions import DeclareLaunchArgument, LogInfo, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from ament_index_python.packages import get_package_share_directory
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
-
-    # ─── 包路径 ────────────────────────────────────────────────
     czybot_slam_dir = get_package_share_directory('czybot_slam')
     livox_driver_dir = get_package_share_directory('livox_ros_driver2')
 
-    # ─── Launch 参数声明 ───────────────────────────────────────
-    declare_use_sim_time = DeclareLaunchArgument(
-        'use_sim_time',
-        default_value='false',
-        description='是否使用仿真时钟'
-    )
-
-    declare_use_rviz = DeclareLaunchArgument(
-        'use_rviz',
-        default_value='true',
-        description='是否启动RViz2可视化（默认开启，打开即可见建图效果）'
-    )
-
-    declare_stm32_port = DeclareLaunchArgument(
-        'stm32_port',
-        default_value='/dev/ttyUSB0',
-        description='STM32底盘串口（若不存在自动探测ttyUSB0/1/2）'
-    )
-
-    declare_stm32_baudrate = DeclareLaunchArgument(
-        'stm32_baudrate',
-        default_value='115200',
-        description='STM32底盘串口波特率'
-    )
-
-    declare_resolution = DeclareLaunchArgument(
-        'resolution',
-        default_value='0.05',
-        description='占据栅格地图分辨率(m)'
-    )
-
-    declare_publish_period = DeclareLaunchArgument(
-        'publish_period_sec',
-        default_value='1.0',
-        description='地图发布周期(秒)'
-    )
-
-    # ─── LaunchConfiguration 引用 ─────────────────────────────
-    use_sim_time      = LaunchConfiguration('use_sim_time')
-    use_rviz          = LaunchConfiguration('use_rviz')
-    stm32_port        = LaunchConfiguration('stm32_port')
-    stm32_baudrate    = LaunchConfiguration('stm32_baudrate')
-    resolution        = LaunchConfiguration('resolution')
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    use_rviz = LaunchConfiguration('use_rviz')
+    stm32_port = LaunchConfiguration('stm32_port')
+    stm32_baudrate = LaunchConfiguration('stm32_baudrate')
+    resolution = LaunchConfiguration('resolution')
     publish_period_sec = LaunchConfiguration('publish_period_sec')
 
-    # ─── 节点定义 ──────────────────────────────────────────────
+    lidar_x = LaunchConfiguration('lidar_x')
+    lidar_y = LaunchConfiguration('lidar_y')
+    lidar_z = LaunchConfiguration('lidar_z')
+    lidar_qx = LaunchConfiguration('lidar_qx')
+    lidar_qy = LaunchConfiguration('lidar_qy')
+    lidar_qz = LaunchConfiguration('lidar_qz')
+    lidar_qw = LaunchConfiguration('lidar_qw')
 
-    # 1. STM32 底盘桥接（立即启动）
-    # 订阅：/cmd_vel；发布：/odom（仅用于监控，不发TF）
-    # ⚠️ publish_tf=False：Cartographer(provide_odom_frame=true)负责维护
-    #    odom→base_link TF，STM32不再发布，避免TF冲突导致建图抖动。
+    scan_min_height = LaunchConfiguration('scan_min_height')
+    scan_max_height = LaunchConfiguration('scan_max_height')
+    scan_range_max = LaunchConfiguration('scan_range_max')
+    scan_dedup_min_interval_ms = LaunchConfiguration('scan_dedup_min_interval_ms')
+    rewrite_scan_stamps = LaunchConfiguration('rewrite_scan_stamps')
+
+    declared_arguments = [
+        DeclareLaunchArgument(
+            'use_sim_time',
+            default_value='false',
+            description='Use simulation clock',
+        ),
+        DeclareLaunchArgument(
+            'use_rviz',
+            default_value='true',
+            description='Start RViz2',
+        ),
+        DeclareLaunchArgument(
+            'stm32_port',
+            default_value='/dev/ttyUSB0',
+            description='STM32 serial port',
+        ),
+        DeclareLaunchArgument(
+            'stm32_baudrate',
+            default_value='115200',
+            description='STM32 serial baudrate',
+        ),
+        DeclareLaunchArgument(
+            'resolution',
+            default_value='0.05',
+            description='Occupancy grid resolution in meters',
+        ),
+        DeclareLaunchArgument(
+            'publish_period_sec',
+            default_value='1.0',
+            description='Occupancy grid publish period',
+        ),
+        DeclareLaunchArgument(
+            'lidar_x',
+            default_value='0.0',
+            description='Livox x offset from base_link in meters',
+        ),
+        DeclareLaunchArgument(
+            'lidar_y',
+            default_value='0.0',
+            description='Livox y offset from base_link in meters',
+        ),
+        DeclareLaunchArgument(
+            'lidar_z',
+            default_value='0.15',
+            description='Livox z offset from base_link in meters',
+        ),
+        DeclareLaunchArgument(
+            'lidar_qx',
+            default_value='0.0',
+            description='Livox static TF quaternion x',
+        ),
+        DeclareLaunchArgument(
+            'lidar_qy',
+            default_value='-0.342',
+            description='Livox static TF quaternion y',
+        ),
+        DeclareLaunchArgument(
+            'lidar_qz',
+            default_value='0.0',
+            description='Livox static TF quaternion z',
+        ),
+        DeclareLaunchArgument(
+            'lidar_qw',
+            default_value='0.940',
+            description='Livox static TF quaternion w',
+        ),
+        DeclareLaunchArgument(
+            'scan_min_height',
+            default_value='-0.20',
+            description='Minimum point height used for LaserScan projection',
+        ),
+        DeclareLaunchArgument(
+            'scan_max_height',
+            default_value='0.35',
+            description='Maximum point height used for LaserScan projection',
+        ),
+        DeclareLaunchArgument(
+            'scan_range_max',
+            default_value='15.0',
+            description='Maximum range used by projected LaserScan',
+        ),
+        DeclareLaunchArgument(
+            'scan_dedup_min_interval_ms',
+            default_value='80.0',
+            description='Minimum /scan_dedup output interval in milliseconds',
+        ),
+        DeclareLaunchArgument(
+            'rewrite_scan_stamps',
+            default_value='true',
+            description='Allow scan_dedup to rewrite non-monotonic timestamps',
+        ),
+    ]
+
     stm32_bridge_node = Node(
         package='czybot_navigation2',
         executable='stm32_bridge',
@@ -131,51 +137,43 @@ def generate_launch_description():
         parameters=[{
             'port': stm32_port,
             'baudrate': stm32_baudrate,
-            'publish_tf': False,   # v2: 关闭STM32的TF发布，由Cartographer维护
-        }]
+            'publish_tf': False,
+        }],
     )
 
-    # 2. 静态TF：base_link → livox_frame（立即发布）
-    # 360S安装在车体中心正上方，高度约15cm
-    # ⚠️ 雷达实际安装前倾约40°（绕Y轴旋转 pitch=-40°）
-    # 四元数计算：pitch=-40° → qx=0, qy=sin(-20°)=-0.342, qz=0, qw=cos(-20°)=0.940
-    # 若前倾角度有变化，请用以下公式重新计算：
-    #   qy = sin(pitch/2), qw = cos(pitch/2)，pitch 单位为弧度，前倾为负值
     static_tf_base_to_livox = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='static_tf_base_to_livox',
         arguments=[
-            '0.0', '0.0', '0.15',              # x y z：360S相对base_link的安装位置（米）
-            '0.0', '-0.342', '0.0', '0.940',   # qx qy qz qw：前倾40°（pitch=-40°）
+            lidar_x, lidar_y, lidar_z,
+            lidar_qx, lidar_qy, lidar_qz, lidar_qw,
             'base_link',
-            'livox_frame'
+            'livox_frame',
         ],
-        output='screen'
+        output='screen',
     )
 
-    # 3. Livox Mid-360S 驱动（t=3s）
-    livox_config_path = os.path.join(livox_driver_dir, 'config', 'MID360s_config.json')
-
+    livox_config_path = os.path.join(
+        livox_driver_dir, 'config', 'MID360s_config.json'
+    )
     livox_driver_node = Node(
         package='livox_ros_driver2',
         executable='livox_ros_driver2_node',
         name='livox_lidar_publisher',
         output='screen',
         parameters=[{
-            'xfer_format': 0,         # 0=PointXYZRTL，与pointcloud_to_laserscan兼容
-            'multi_topic': 0,         # 0=所有雷达共享同一话题
-            'data_src': 0,            # 0=实体雷达
-            'publish_freq': 10.0,     # 10Hz，Cartographer推荐频率
+            'xfer_format': 0,
+            'multi_topic': 0,
+            'data_src': 0,
+            'publish_freq': 10.0,
             'output_data_type': 0,
             'frame_id': 'livox_frame',
             'use_sim_time': use_sim_time,
             'user_config_path': livox_config_path,
-        }]
+        }],
     )
 
-    # 4. PointCloud2 → LaserScan 转换（t=5s）
-    # 将360S的3D点云水平切片，生成/scan供Cartographer 2D使用
     pointcloud_to_laserscan_node = Node(
         package='pointcloud_to_laserscan',
         executable='pointcloud_to_laserscan_node',
@@ -183,27 +181,33 @@ def generate_launch_description():
         output='screen',
         parameters=[
             os.path.join(czybot_slam_dir, 'config', 'pointcloud_to_laserscan.yaml'),
-            {'use_sim_time': use_sim_time}
+            {
+                'use_sim_time': use_sim_time,
+                'min_height': ParameterValue(scan_min_height, value_type=float),
+                'max_height': ParameterValue(scan_max_height, value_type=float),
+                'range_max': ParameterValue(scan_range_max, value_type=float),
+            },
         ],
         remappings=[
             ('cloud_in', '/livox/lidar'),
-            ('scan',     '/scan'),
-        ]
+            ('scan', '/scan'),
+        ],
     )
 
-    # 4.5. Scan 时间戳去重节点（t=5.5s）
-    # 丢弃时间戳重复的 LaserScan 帧，发布到 /scan_dedup
-    # 使用 BEST_EFFORT QoS 匹配 pointcloud_to_laserscan 发布端
     scan_dedup_node = Node(
         package='czybot_slam',
         executable='scan_dedup.py',
         name='scan_dedup',
         output='screen',
+        parameters=[{
+            'min_interval_ms': ParameterValue(
+                scan_dedup_min_interval_ms, value_type=float
+            ),
+            'rewrite_stamps': ParameterValue(rewrite_scan_stamps, value_type=bool),
+        }],
     )
 
-    # 5. Cartographer 2D 建图节点（t=7s）
     cartographer_config_dir = os.path.join(czybot_slam_dir, 'config')
-
     cartographer_node = Node(
         package='cartographer_ros',
         executable='cartographer_node',
@@ -216,11 +220,9 @@ def generate_launch_description():
         ],
         remappings=[
             ('scan', '/scan_dedup'),
-            # 不再重映射 odom（use_odometry=false，Cartographer不订阅odom）
-        ]
+        ],
     )
 
-    # 6. Cartographer 占据栅格地图发布节点（t=8s）
     occupancy_grid_node = Node(
         package='cartographer_ros',
         executable='cartographer_occupancy_grid_node',
@@ -233,14 +235,10 @@ def generate_launch_description():
         arguments=[
             '-resolution', resolution,
             '-publish_period_sec', publish_period_sec,
-        ]
+        ],
     )
 
-    # 7. RViz2 可视化（t=9s，等待/map和/scan话题就绪后再启动）
-    # 使用预配置的slam_2d.rviz：包含Map、LaserScan、SubmapList、PointCloud2、Odometry、TF
-    # 打开即可看到建图效果，无需手动添加显示项
     rviz_config = os.path.join(czybot_slam_dir, 'rviz', 'slam_2d.rviz')
-
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
@@ -248,45 +246,24 @@ def generate_launch_description():
         output='screen',
         arguments=['-d', rviz_config],
         parameters=[{'use_sim_time': use_sim_time}],
-        condition=IfCondition(use_rviz)
+        condition=IfCondition(use_rviz),
     )
 
-    # ─── 组装 LaunchDescription（按时序延迟启动）────────────────
     return LaunchDescription([
-        # 参数声明
-        declare_use_sim_time,
-        declare_use_rviz,
-        declare_stm32_port,
-        declare_stm32_baudrate,
-        declare_resolution,
-        declare_publish_period,
-
-        # 启动提示
-        LogInfo(msg='[czybot_slam] 启动 Cartographer 2D SLAM v2...'),
-        LogInfo(msg='[czybot_slam] 硬件: RDK S100 + Livox Mid-360S + STM32底盘'),
-        LogInfo(msg='[czybot_slam] 模式: 纯激光扫描匹配（已关闭外部里程计融合，避免转弯重影）'),
-        LogInfo(msg='[czybot_slam] RViz2 将在9秒后自动打开（/map和/scan就绪后）'),
-        LogInfo(msg='[czybot_slam] 建图完成后执行: bash ~/rdks100_slam/ros2_ws/src/czybot_slam/scripts/save_map.sh'),
-
-        # t=0s：STM32桥接 + 静态TF
+        *declared_arguments,
+        LogInfo(msg='[czybot_slam] Starting Cartographer 2D SLAM.'),
+        LogInfo(
+            msg='[czybot_slam] STM32 TF disabled; Cartographer owns SLAM TF.'
+        ),
+        LogInfo(
+            msg='[czybot_slam] Tune lidar_* and scan_* launch arguments on site.'
+        ),
         stm32_bridge_node,
         static_tf_base_to_livox,
-
-        # t=3s：Livox驱动
         TimerAction(period=3.0, actions=[livox_driver_node]),
-
-        # t=5s：点云转激光扫描
         TimerAction(period=5.0, actions=[pointcloud_to_laserscan_node]),
-
-        # t=5.5s：扫描时间戳去重
         TimerAction(period=5.5, actions=[scan_dedup_node]),
-
-        # t=7s：Cartographer建图
         TimerAction(period=7.0, actions=[cartographer_node]),
-
-        # t=8s：地图栅格发布
         TimerAction(period=8.0, actions=[occupancy_grid_node]),
-
-        # t=9s：RViz2（此时/map、/scan、/submap_list均已就绪）
         TimerAction(period=9.0, actions=[rviz_node]),
     ])
