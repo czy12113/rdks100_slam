@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cartographer 2D SLAM 建图主启动文件
+Cartographer 2D SLAM 建图主启动文件  v2
 硬件：RDK S100 + Livox Mid-360S + STM32底盘
 
 数据流：
@@ -13,20 +13,36 @@ Cartographer 2D SLAM 建图主启动文件
               /scan (LaserScan)
                      │
                      ▼
+           scan_dedup（时间戳修复+限速）
+                     │
+                     ▼
+              /scan_dedup (LaserScan)
+                     │
+                     ▼
           cartographer_node (2D SLAM)
                      │
                      ▼
-     /map + /tf(map→odom) + /submap_list
+     /map + /tf(map→odom→base_link) + /submap_list
 
-TF 树：
-  map → odom (由Cartographer发布)
-  odom → base_link (由STM32底盘stm32_bridge发布)
+TF 树（v2，关闭外部odom）：
+  map → odom      (由Cartographer内部维护，provide_odom_frame=true)
+  odom → base_link (由Cartographer发布，published_frame="base_link")
   base_link → livox_frame (静态TF，本文件发布)
 
+  注：STM32 stm32_bridge 仍然运行（用于接收 cmd_vel 控制小车），
+      但 publish_tf=false，不发布 odom→base_link TF，避免与
+      Cartographer 的 TF 冲突。里程计话题 /odom 仍发布供监控使用。
+
+  为什么关闭外部里程计融合（use_odometry=false）：
+      STM32里程计缺少协方差矩阵（全为0），Cartographer无法评估置信度，
+      转弯时累积误差直接注入位姿估计，导致地图重影。
+      Livox 360° 全向扫描匹配精度足够独立建图。
+
 启动时序：
-  t=0s   STM32桥接 + 静态TF
+  t=0s   STM32桥接（仅收发cmd_vel，不发TF）+ 静态TF
   t=3s   Livox Mid-360S 驱动
   t=5s   pointcloud_to_laserscan
+  t=5.5s scan_dedup（时间戳修复）
   t=7s   Cartographer 建图节点
   t=8s   Cartographer 地图发布节点
   t=9s   RViz2（此时/map和/scan都已就绪，打开即可见建图效果）
@@ -104,7 +120,9 @@ def generate_launch_description():
     # ─── 节点定义 ──────────────────────────────────────────────
 
     # 1. STM32 底盘桥接（立即启动）
-    # 发布：/odom、TF(odom→base_link)；订阅：/cmd_vel
+    # 订阅：/cmd_vel；发布：/odom（仅用于监控，不发TF）
+    # ⚠️ publish_tf=False：Cartographer(provide_odom_frame=true)负责维护
+    #    odom→base_link TF，STM32不再发布，避免TF冲突导致建图抖动。
     stm32_bridge_node = Node(
         package='czybot_navigation2',
         executable='stm32_bridge',
@@ -113,7 +131,7 @@ def generate_launch_description():
         parameters=[{
             'port': stm32_port,
             'baudrate': stm32_baudrate,
-            'publish_tf': True,
+            'publish_tf': False,   # v2: 关闭STM32的TF发布，由Cartographer维护
         }]
     )
 
@@ -198,7 +216,7 @@ def generate_launch_description():
         ],
         remappings=[
             ('scan', '/scan_dedup'),
-            ('odom', '/odom'),
+            # 不再重映射 odom（use_odometry=false，Cartographer不订阅odom）
         ]
     )
 
@@ -244,8 +262,9 @@ def generate_launch_description():
         declare_publish_period,
 
         # 启动提示
-        LogInfo(msg='[czybot_slam] 启动 Cartographer 2D SLAM...'),
+        LogInfo(msg='[czybot_slam] 启动 Cartographer 2D SLAM v2...'),
         LogInfo(msg='[czybot_slam] 硬件: RDK S100 + Livox Mid-360S + STM32底盘'),
+        LogInfo(msg='[czybot_slam] 模式: 纯激光扫描匹配（已关闭外部里程计融合，避免转弯重影）'),
         LogInfo(msg='[czybot_slam] RViz2 将在9秒后自动打开（/map和/scan就绪后）'),
         LogInfo(msg='[czybot_slam] 建图完成后执行: bash ~/rdks100_slam/ros2_ws/src/czybot_slam/scripts/save_map.sh'),
 

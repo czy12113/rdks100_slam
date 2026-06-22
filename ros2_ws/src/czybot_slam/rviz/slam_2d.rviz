@@ -122,6 +122,8 @@ Visualization Manager:
       Value: true
 
     # ─── Mid-360S 原始点云（3D彩色点，便于验证雷达正常）──
+    # ⚡ 性能优化：默认关闭原始点云显示，200K点/秒渲染是RViz2卡顿主因
+    # 调试时手动在RViz2面板中勾选 Enabled 即可开启
     - Alpha: 0.8
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -133,21 +135,21 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 50; 200; 255
       Color Transformer: AxisColor
-      Decay Time: 0.20000000298023224
-      Enabled: true
+      Decay Time: 0
+      Enabled: false
       Invert Rainbow: false
       Max Color: 255; 200; 50
       Max Intensity: 0
       Min Color: 50; 50; 255
       Min Intensity: 0
-      Name: PointCloud2 (Mid-360S)
+      Name: PointCloud2 (Mid-360S) [调试用-默认关闭]
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
       Size (m): 0.019999999552965164
       Style: Points
       Topic:
-        Depth: 5
+        Depth: 1
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
@@ -155,15 +157,16 @@ Visualization Manager:
         Value: /livox/lidar
       Use Fixed Frame: true
       Use rainbow: true
-      Value: true
+      Value: false
 
     # ─── 里程计轨迹（小车运动轨迹）──────────────────────
+    # ⚡ 性能优化：Keep从200降到50，减少历史箭头渲染数量
     - Class: rviz_default_plugins/Odometry
       Enabled: true
-      Keep: 200
+      Keep: 50
       Name: Odometry
-      Position Tolerance: 0.05000000074505806
-      Angle Tolerance: 0.05000000074505806
+      Position Tolerance: 0.10000000149011612
+      Angle Tolerance: 0.10000000149011612
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -189,8 +192,9 @@ Visualization Manager:
         Value: false
 
     # ─── TF坐标系树（调试用）──────────────────────────
+    # ⚡ 性能优化：默认关闭TF显示（实时更新开销较大），调试时手动开启
     - Class: rviz_default_plugins/TF
-      Enabled: true
+      Enabled: false
       Frame Timeout: 15
       Frames:
         All Enabled: false
@@ -203,20 +207,20 @@ Visualization Manager:
         odom:
           Value: true
       Marker Scale: 0.5
-      Name: TF
+      Name: TF [调试用-默认关闭]
       Show Arrows: true
       Show Axes: true
       Show Names: true
       Tree:
         {}
-      Update Interval: 0
-      Value: true
+      Update Interval: 0.5
+      Value: false
 
   Enabled: true
   Global Options:
     Background Color: 40; 40; 40
     Fixed Frame: map
-    Frame Rate: 30
+    Frame Rate: 15
   Name: root
   Tools:
     - Class: rviz_default_plugins/Interact

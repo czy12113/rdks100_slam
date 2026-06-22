@@ -99,6 +99,10 @@ LIDAR_MIN_RANGE: float = 0.1           # 最小测距范围（米）
 LIDAR_ANGLE_MIN: float = -3.14159      # 最小角度（rad）
 LIDAR_ANGLE_MAX: float = 3.14159       # 最大角度（rad）
 LIDAR_POINTS_PER_SCAN: int = 360       # 每圈点数
+# 激光雷达安装俯仰角（度）：雷达前倾为负值，后仰为正值
+# Livox Mid-360S 实际安装前倾约 40°，因此填 -40.0
+# 后端点云解析时会绕 Y 轴旋转该角度，抵消安装倾斜，使点云在前端显示为水平摆正状态
+LIDAR_MOUNT_PITCH_DEG: float = float(os.getenv("LIDAR_MOUNT_PITCH_DEG", "-40.0"))
 
 # -----------------------------------------------------------------------------
 # 相机配置

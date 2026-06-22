@@ -19,6 +19,7 @@ from app.core.config import (
     ROS2_SERVICE_SAVE_MAP, ROS2_SERVICE_LOAD_MAP,
     ROS2_SERVICE_START_SLAM, ROS2_SERVICE_STOP_SLAM,
     ROBOT_MAX_LINEAR_VEL, ROBOT_MAX_ANGULAR_VEL,
+    LIDAR_MOUNT_PITCH_DEG,
 )
 
 logger = logging.getLogger(__name__)
@@ -274,9 +275,30 @@ class ROS2Bridge:
         字段布局：x(float32) y(float32) z(float32) intensity(float32)
         输出紧凑格式 [x, y, z, intensity] 减少 JSON 体积
         同时对点数降采样，控制 WebSocket 带宽
+
+        前倾角补偿：
+        雷达安装时绕 Y 轴前倾（LIDAR_MOUNT_PITCH_DEG，前倾为负值），
+        需绕 Y 轴旋转 -pitch_deg 还原为水平坐标系：
+          x' =  x * cos(θ) + z * sin(θ)
+          y' =  y
+          z' = -x * sin(θ) + z * cos(θ)
+        其中 θ = -LIDAR_MOUNT_PITCH_DEG（弧度），即对安装角取反做补偿。
+        运行时可通过 /api/device/config 的 lidar.mount_pitch 字段覆盖此值。
         """
         import struct
         import math
+
+        # ── 读取运行时前倾角覆盖值（device.py 运行时配置，热更新无需重启）──────
+        try:
+            from app.api.device import _runtime_config as _rtcfg
+            pitch_deg = float(_rtcfg.get("lidar", {}).get("mount_pitch", LIDAR_MOUNT_PITCH_DEG))
+        except Exception:
+            pitch_deg = LIDAR_MOUNT_PITCH_DEG
+
+        # 补偿角 = -安装角，即把前倾的坐标系转回水平
+        comp_rad = math.radians(-pitch_deg)
+        cos_c = math.cos(comp_rad)
+        sin_c = math.sin(comp_rad)
 
         # 解析 PointCloud2 字段偏移
         field_offsets = {}
@@ -324,14 +346,20 @@ class ROS2Bridge:
             if dist_xy < 0.02 or dist_xy > 40.0:
                 continue
 
+            # ── 应用前倾角补偿：绕 Y 轴旋转 comp_rad ─────────────────────────
+            # ROS 坐标系：X=前, Y=左, Z=上；绕 Y 轴旋转只影响 X/Z 分量
+            xc = x * cos_c + z * sin_c
+            yc = y
+            zc = -x * sin_c + z * cos_c
+
             # 保留 3 位小数（毫米级精度），intensity 归一化到 0~255 整数节省带宽
             points.append([
-                round(x, 3),
-                round(y, 3),
-                round(z, 3),
+                round(xc, 3),
+                round(yc, 3),
+                round(zc, 3),
                 min(255, max(0, int(intensity))),
             ])
-            z_values.append(z)
+            z_values.append(zc)
             distances.append(dist_xy)
             intensities.append(intensity)
 

@@ -10,7 +10,7 @@ from typing import Any, Dict
 from app.core.config import (
     MOCK_MODE, ROS2_ENABLED, DEVICE_NAME, DEVICE_VERSION,
     CAMERA_RGB_WIDTH, CAMERA_RGB_HEIGHT, CAMERA_FPS, CAMERA_JPEG_QUALITY,
-    LIDAR_MAX_RANGE, LIDAR_MIN_RANGE, LIDAR_POINTS_PER_SCAN,
+    LIDAR_MAX_RANGE, LIDAR_MIN_RANGE, LIDAR_POINTS_PER_SCAN, LIDAR_MOUNT_PITCH_DEG,
     IMU_SAMPLE_RATE, IMU_ACCEL_RANGE, IMU_GYRO_RANGE,
     ROS2_TOPIC_LIDAR3D, ROS2_TOPIC_IMU,
 )
@@ -86,6 +86,9 @@ async def get_config():
             "max_range": LIDAR_MAX_RANGE,
             "min_range": LIDAR_MIN_RANGE,
             "points_per_scan": LIDAR_POINTS_PER_SCAN,
+            # 安装俯仰角（度）：前倾为负，后仰为正
+            # 后端点云解析时会对原始点云做绕 Y 轴的旋转补偿，抵消安装倾斜
+            "mount_pitch": LIDAR_MOUNT_PITCH_DEG,
         },
         "imu": {
             "sample_rate": IMU_SAMPLE_RATE,

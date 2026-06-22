@@ -120,7 +120,7 @@
                     <el-button type="primary" size="small" @click="saveLidarConfig">保存</el-button>
                   </div>
                 </template>
-                <el-form :model="lidarConfig" label-width="140px">
+                <el-form :model="lidarConfig" label-width="160px">
                   <el-form-item label="Topic 名称">
                     <el-input v-model="lidarConfig.topic" />
                   </el-form-item>
@@ -132,6 +132,14 @@
                   </el-form-item>
                   <el-form-item label="启用滤波">
                     <el-switch v-model="lidarConfig.filter_enabled" />
+                  </el-form-item>
+                  <el-form-item label="安装俯仰角 (°)">
+                    <el-input-number
+                      v-model="lidarConfig.mount_pitch"
+                      :min="-90" :max="90" :step="1"
+                      :precision="1"
+                    />
+                    <span class="form-tip">前倾为负值（如 -40°），后仰为正值。保存后点云立即补偿</span>
                   </el-form-item>
                 </el-form>
               </el-card>
@@ -290,6 +298,7 @@ const lidarConfig = ref({
   max_range: 40.0,
   min_range: 0.02,
   filter_enabled: true,
+  mount_pitch: -40.0,  // 安装俯仰角（度）：前倾为负值，后端点云解析时补偿
 })
 
 // ---- 串口配置 ----
@@ -425,7 +434,7 @@ async function resetConfig() {
     )
     await deviceApi.resetConfig()
     motionConfig.value = { max_linear: 1.0, max_angular: 1.57, max_accel: 0.5, max_decel: 1.0 }
-    lidarConfig.value = { topic: '/livox/lidar', max_range: 40.0, min_range: 0.02, filter_enabled: true }
+    lidarConfig.value = { topic: '/livox/lidar', max_range: 40.0, min_range: 0.02, filter_enabled: true, mount_pitch: -40.0 }
     serialConfig.value = { port: '/dev/ttyUSB0', baudrate: 115200, publish_tf: true }
     ElMessage.success('已恢复默认配置')
   } catch (e: any) {

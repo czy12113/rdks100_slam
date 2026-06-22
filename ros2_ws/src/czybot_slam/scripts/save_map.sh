@@ -38,9 +38,10 @@ echo -e "${YELLOW}[INFO] 保存路径: ${MAP_DIR}/${MAP_NAME}${NC}"
 echo ""
 
 # 保存地图（nav2_map_server）
+# ⚠️ save_map_timeout 必须是 double 类型，整数会报类型错误（ROS2 Humble）
 ros2 run nav2_map_server map_saver_cli \
     -f "${MAP_DIR}/${MAP_NAME}" \
-    --ros-args -p save_map_timeout:=10000
+    --ros-args -p save_map_timeout:=10000.0
 
 if [ $? -eq 0 ]; then
     echo ""
