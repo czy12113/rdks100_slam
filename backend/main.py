@@ -20,6 +20,8 @@ from app.core.config import (
 )
 from app.core.websocket_manager import ws_manager
 from app.services.data_pusher import start_all_push_tasks
+from app.services.ros2_bridge import ros2_bridge
+from app.services.safety_gate import safety_gate
 from app.api import control, slam, navigation, device
 
 # -----------------------------------------------------------------------------
@@ -50,7 +52,21 @@ async def lifespan(app: FastAPI):
     global _push_tasks
     _push_tasks = await start_all_push_tasks()
 
+    # 安全门 watchdog：绑定底层发布函数并启动后台线程
+    safety_gate.bind_publisher(ros2_bridge.publish_cmd_vel)
+    safety_gate.start_watchdog()
+
     yield  # 应用运行中
+
+    # 关闭前主动发停车（双通道：cmd_vel + estop topic）
+    try:
+        if ros2_bridge.is_enabled:
+            ros2_bridge.publish_cmd_vel(0.0, 0.0, 0.0)
+            ros2_bridge.publish_estop()
+    except Exception as e:
+        logger.warning("[Main] 关闭前发送停车失败: %s", e)
+
+    safety_gate.stop_watchdog()
 
     # 关闭时取消所有推送任务
     for task in _push_tasks:

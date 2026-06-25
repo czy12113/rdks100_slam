@@ -3,8 +3,8 @@
 # 用法: bash deploy.sh
 
 REMOTE_USER="sunrise"
-#REMOTE_HOST="10.21.1.145"
-REMOTE_HOST="10.132.169.198"
+REMOTE_HOST="10.21.1.145"
+#REMOTE_HOST="10.132.169.198"
 REMOTE_PASS="sunrise"
 REMOTE_DIR="/home/sunrise/rdks100_slam"
 LOCAL_DIR="/home/kkk/rdks100_slam"

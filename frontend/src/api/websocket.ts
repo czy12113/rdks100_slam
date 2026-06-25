@@ -107,6 +107,20 @@ class WebSocketClient {
     return true
   }
 
+  /**
+   * sendBeacon 兜底：浏览器关闭/刷新/导航离开时仍能把停车送达后端。
+   * 通过独立的 HTTP 通道（/api/control/stop）保证 WebSocket 没机会发的最后一帧也能到达。
+   * 失败不会阻塞 unload 流程。
+   */
+  beaconEstop(httpEndpoint: string): boolean {
+    try {
+      const blob = new Blob(['{}'], { type: 'application/json' })
+      return navigator.sendBeacon(httpEndpoint, blob)
+    } catch {
+      return false
+    }
+  }
+
   /** 订阅指定 topic（通知后端） */
   subscribe(topic: string) {
     this.send({ action: 'subscribe', topic })

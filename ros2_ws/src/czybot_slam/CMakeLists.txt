@@ -28,6 +28,10 @@ install(DIRECTORY
 install(PROGRAMS scripts/save_map.sh DESTINATION lib/${PROJECT_NAME} RENAME save_map)
 
 # 安装 Python 可执行脚本
-install(PROGRAMS scripts/scan_dedup.py DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS
+  scripts/scan_dedup.py
+  scripts/scan_filter.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 ament_package()

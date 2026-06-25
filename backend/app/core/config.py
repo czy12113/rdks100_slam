@@ -84,12 +84,25 @@ ROS2_SERVICE_CLEAR_COSTMAP: str = "/clear_costmaps"         # 清除代价地图
 
 # -----------------------------------------------------------------------------
 # 机器人运动参数
+# 数值与 STM32 USER/ChassisParams.h 一致：
+#   MAX_LINEAR_SPEED  = 0.60 m/s
+#   MAX_ANGULAR_SPEED = 1.20 rad/s
+#   LINEAR_DEADBAND   = 0.02 m/s
+#   ANGULAR_DEADBAND  = 0.03 rad/s
+# 上位机的死区取得比下位机更小（ROBOT_LINEAR_DEADBAND/ROBOT_ANGULAR_DEADBAND），
+# 让 STM32 做最终判定，避免 RDK 把"非零但很小"的指令长期发给电机引起抖动。
 # -----------------------------------------------------------------------------
-ROBOT_MAX_LINEAR_VEL: float = 1.0      # 最大线速度（m/s）
-ROBOT_MAX_ANGULAR_VEL: float = 1.5     # 最大角速度（rad/s）
-ROBOT_DEFAULT_LINEAR_VEL: float = 0.3  # 默认线速度（m/s）
-ROBOT_DEFAULT_ANGULAR_VEL: float = 0.5 # 默认角速度（rad/s）
-ROBOT_EMERGENCY_STOP_DECEL: float = 2.0 # 急停减速度（m/s²）
+ROBOT_MAX_LINEAR_VEL: float = float(os.getenv("ROBOT_MAX_LINEAR_VEL", "0.60"))
+ROBOT_MAX_ANGULAR_VEL: float = float(os.getenv("ROBOT_MAX_ANGULAR_VEL", "1.20"))
+ROBOT_DEFAULT_LINEAR_VEL: float = float(os.getenv("ROBOT_DEFAULT_LINEAR_VEL", "0.25"))
+ROBOT_DEFAULT_ANGULAR_VEL: float = float(os.getenv("ROBOT_DEFAULT_ANGULAR_VEL", "0.50"))
+ROBOT_LINEAR_DEADBAND: float = float(os.getenv("ROBOT_LINEAR_DEADBAND", "0.005"))
+ROBOT_ANGULAR_DEADBAND: float = float(os.getenv("ROBOT_ANGULAR_DEADBAND", "0.010"))
+ROBOT_EMERGENCY_STOP_DECEL: float = 2.0  # 急停减速度（m/s²，仅用于显示）
+# 急停锁定时长（s）：触发急停后，本时长内忽略任何非零速请求
+ROBOT_ESTOP_LOCK_SECONDS: float = float(os.getenv("ROBOT_ESTOP_LOCK_SECONDS", "0.5"))
+# 后端 watchdog：超过此时长未收到任何手动 cmd_vel/estop 调用，主动把零速发到 ROS2
+ROBOT_CMD_WATCHDOG_SECONDS: float = float(os.getenv("ROBOT_CMD_WATCHDOG_SECONDS", "0.4"))
 
 # -----------------------------------------------------------------------------
 # 激光雷达配置
@@ -99,10 +112,9 @@ LIDAR_MIN_RANGE: float = 0.1           # 最小测距范围（米）
 LIDAR_ANGLE_MIN: float = -3.14159      # 最小角度（rad）
 LIDAR_ANGLE_MAX: float = 3.14159       # 最大角度（rad）
 LIDAR_POINTS_PER_SCAN: int = 360       # 每圈点数
-# 激光雷达安装俯仰角（度）：雷达前倾为负值，后仰为正值
-# Livox Mid-360S 实际安装前倾约 40°，因此填 -40.0
-# 后端点云解析时会绕 Y 轴旋转该角度，抵消安装倾斜，使点云在前端显示为水平摆正状态
-LIDAR_MOUNT_PITCH_DEG: float = float(os.getenv("LIDAR_MOUNT_PITCH_DEG", "-40.0"))
+# 激光雷达安装俯仰角（度）：水平安装为 0.0；前倾为负值，后仰为正值
+# 默认按水平安装处理，不对前端点云做额外俯仰补偿
+LIDAR_MOUNT_PITCH_DEG: float = float(os.getenv("LIDAR_MOUNT_PITCH_DEG", "0.0"))
 
 # -----------------------------------------------------------------------------
 # 相机配置

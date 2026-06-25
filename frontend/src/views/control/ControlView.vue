@@ -581,13 +581,77 @@ watch(() => controlLogs.value.length, async () => {
   if (logRef.value) logRef.value.scrollTop = logRef.value.scrollHeight
 })
 
+// ── 安全保护：失焦/可见性/断连/卸载 → 自动停车 ───────────────────────
+let unsubWsStatus: (() => void) | null = null
+
+/**
+ * 安全停车（不强制激活急停锁，只把目标速度归零并发零速）。
+ * 用于失焦/鼠标离开等"轻量"场景：避免用户回来时被锁住操作。
+ */
+function safeStopOnly(reason: string) {
+  keys.value = { w: false, a: false, s: false, d: false }
+  tapVx.value = 0
+  tapWz.value = 0
+  joystickActive = false
+  targetVx = 0
+  targetWz = 0
+  // 直接发零速（双通道：WS + HTTP fallback）
+  sendVelNow(0, 0)
+  controlApi.setVelocity(0, 0, 0).catch(() => {})
+  addLog(`安全停车：${reason}`, 'warn')
+}
+
+/**
+ * 强急停（触发后端 SafetyGate 急停锁）。
+ * 用于断开连接、页面卸载等不可逆场景。
+ */
+function hardEstop(reason: string) {
+  _estopActive = true
+  doForceStop()
+  setTimeout(() => { _estopActive = false }, 300)
+  addLog(`强制急停：${reason}`, 'error')
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState === 'hidden') {
+    safeStopOnly('页面隐藏')
+  }
+}
+function onWindowBlur()  { safeStopOnly('窗口失焦') }
+function onMouseLeave()  { safeStopOnly('鼠标离开窗口') }
+function onPageHide()    { hardEstop('页面卸载/导航离开') }
+function onBeforeUnload(){
+  hardEstop('浏览器关闭')
+  // 浏览器关闭时 WebSocket 大概率已无法发出，靠 sendBeacon 兜底
+  wsClient.beaconEstop('/api/control/stop')
+}
+
 onMounted(() => {
   initJoystick()
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
+
+  // ── 失焦/可见性/卸载安全钩子 ──
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  window.addEventListener('blur', onWindowBlur)
+  document.addEventListener('mouseleave', onMouseLeave)
+  window.addEventListener('pagehide', onPageHide)
+  window.addEventListener('beforeunload', onBeforeUnload)
+
+  // ── WebSocket 状态变化：断开 → 立即发 HTTP 停车 + 标记急停 ──
+  unsubWsStatus = wsClient.onStatusChange((s) => {
+    if (s === 'disconnected' || s === 'error') {
+      hardEstop(`WebSocket ${s}`)
+    }
+  })
+
   startSendLoop()
   unsubOdom = wsClient.on('odom', () => {})
-  addLog('控制界面已就绪（WebSocket 控制通道）', 'info')
+
+  // 进入页面立即同步一帧零速，确保后端 SafetyGate 状态干净
+  sendVelNow(0, 0)
+
+  addLog('控制界面已就绪（WebSocket 控制通道，含失焦/断连保护）', 'info')
   addLog('WASD/方向键/摇杆控制，空格键急停', 'info')
 })
 
@@ -595,9 +659,15 @@ onUnmounted(() => {
   joystick?.destroy()
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('keyup', onKeyUp)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  window.removeEventListener('blur', onWindowBlur)
+  document.removeEventListener('mouseleave', onMouseLeave)
+  window.removeEventListener('pagehide', onPageHide)
+  window.removeEventListener('beforeunload', onBeforeUnload)
   if (sendTimer) clearInterval(sendTimer)
   if (unsubOdom) unsubOdom()
-  // 离开页面：双通道发送停车
+  if (unsubWsStatus) unsubWsStatus()
+  // 离开/切换路由：双通道发送停车（含 SafetyGate 急停锁）
   wsClient.sendEstop()
   controlApi.stop().catch(() => {})
 })

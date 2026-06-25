@@ -105,16 +105,28 @@ class WebSocketManager:
         return True
 
     async def disconnect(self, ws: WebSocket):
-        """断开连接，清理所有订阅"""
+        """
+        断开连接，清理所有订阅。
+        若断开的是最后一个客户端，自动触发急停 —— 防止前端
+        浏览器关闭、网络中断、组件卸载时小车继续运动。
+        """
         async with self._lock:
             topics = self._client_topics.pop(ws, set())
             self._total_connections = max(0, self._total_connections - 1)
+            remaining = self._total_connections
 
         for topic in topics:
             if topic in self._groups:
                 await self._groups[topic].remove(ws)
 
-        logger.info(f"[WS] 连接断开，总连接数: {self._total_connections}")
+        logger.info(f"[WS] 连接断开，总连接数: {remaining}")
+
+        # 最后一个客户端断开 → 主动急停
+        if remaining == 0:
+            try:
+                await self._handle_estop(source="ws_disconnect_last")
+            except Exception as e:
+                logger.warning(f"[WS] 断开后自动急停失败: {e}")
 
     async def subscribe(self, ws: WebSocket, topic: str):
         """订阅指定 topic"""
@@ -188,46 +200,63 @@ class WebSocketManager:
             logger.error(f"[WS] 处理消息异常: {e}")
 
     async def _handle_cmd_vel(self, msg: dict):
-        """处理速度控制消息，直接发布到 ROS2"""
+        """
+        处理速度控制消息：经 SafetyGate 统一限速/死区/急停锁后发布到 ROS2。
+        SafetyGate 也会刷新 last_cmd_time，使后端 watchdog 不会在持续控制中误触发。
+        """
         from app.services.ros2_bridge import ros2_bridge
-        from app.core.config import ROBOT_MAX_LINEAR_VEL, ROBOT_MAX_ANGULAR_VEL
+        from app.services.safety_gate import safety_gate
+        from app.services.mock_data import mock_generator
 
         try:
-            vx = float(msg.get("vx", 0.0))
-            vy = float(msg.get("vy", 0.0))
-            wz = float(msg.get("wz", 0.0))
-
-            # 硬限幅（与 HTTP 接口一致）
-            vx = max(-ROBOT_MAX_LINEAR_VEL, min(ROBOT_MAX_LINEAR_VEL, vx))
-            vy = max(-ROBOT_MAX_LINEAR_VEL, min(ROBOT_MAX_LINEAR_VEL, vy))
-            wz = max(-ROBOT_MAX_ANGULAR_VEL, min(ROBOT_MAX_ANGULAR_VEL, wz))
+            vx, vy, wz, allowed = safety_gate.filter(
+                float(msg.get("vx", 0.0)),
+                float(msg.get("vy", 0.0)),
+                float(msg.get("wz", 0.0)),
+            )
+            if not allowed:
+                # 急停锁中：丢弃该帧；STM32 也会被 estop topic 锁住
+                return
 
             if ros2_bridge.is_enabled:
                 ros2_bridge.publish_cmd_vel(vx, vy, wz)
-            # 模拟模式：更新 mock 状态
-            from app.services.mock_data import mock_generator
             mock_generator.set_velocity(vx, vy, wz)
 
         except (ValueError, TypeError) as e:
             logger.warning(f"[WS] cmd_vel 参数非法: {e}")
 
-    async def _handle_estop(self):
-        """急停处理：连续 5 次发送零速，确保 STM32 收到"""
+    async def _handle_estop(self, source: str = "ws:estop"):
+        """
+        急停处理：
+          1. SafetyGate 进入急停锁（一段时间内拒绝任何非零速）
+          2. 通过独立 topic /cmd_vel_estop 触发 stm32_bridge 急停
+          3. 同时连续发 5 帧零速兜底（每 20ms 一帧）
+        """
         from app.services.ros2_bridge import ros2_bridge
+        from app.services.safety_gate import safety_gate
         from app.services.mock_data import mock_generator
 
+        safety_gate.trigger_estop(source)
         mock_generator.emergency_stop()
 
         if ros2_bridge.is_enabled:
-            # 在线程池中执行，不阻塞事件循环
             loop = asyncio.get_event_loop()
+
             def _send_stop():
+                import time
+                try:
+                    ros2_bridge.publish_estop()
+                except Exception as e:
+                    logger.warning(f"[WS] publish_estop 失败: {e}")
                 for _ in range(5):
-                    ros2_bridge.publish_cmd_vel(0.0, 0.0, 0.0)
-                    import time
-                    time.sleep(0.02)  # 20ms 间隔，确保串口不丢帧
+                    try:
+                        ros2_bridge.publish_cmd_vel(0.0, 0.0, 0.0)
+                    except Exception:
+                        pass
+                    time.sleep(0.02)
+
             await loop.run_in_executor(None, _send_stop)
-        logger.info("[WS] 急停指令已执行（5 帧零速）")
+        logger.info(f"[WS] 急停已执行 source={source}（estop topic + 5 帧零速）")
 
     @property
     def stats(self) -> dict:

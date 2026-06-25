@@ -46,17 +46,29 @@ export const LIDAR_MAX_POINTS: number = 10000
 
 // -----------------------------------------------------------------------------
 // 机器人控制参数
+// 数值与 STM32 USER/ChassisParams.h 完全对齐：
+//   MAX_LINEAR_SPEED  = 0.60 m/s
+//   MAX_ANGULAR_SPEED = 1.20 rad/s
+//   LINEAR_DEADBAND   = 0.02 m/s
+//   ANGULAR_DEADBAND  = 0.03 rad/s
+// 上位机死区取小一点，让 STM32 做最终判定。
 // -----------------------------------------------------------------------------
 /** 最大线速度（m/s） */
-export const ROBOT_MAX_LINEAR_VEL: number = 1.0
+export const ROBOT_MAX_LINEAR_VEL: number = 0.60
 /** 最大角速度（rad/s） */
-export const ROBOT_MAX_ANGULAR_VEL: number = 1.5
+export const ROBOT_MAX_ANGULAR_VEL: number = 1.20
 /** 默认线速度（m/s） */
-export const ROBOT_DEFAULT_LINEAR_VEL: number = 0.3
+export const ROBOT_DEFAULT_LINEAR_VEL: number = 0.25
 /** 默认角速度（rad/s） */
-export const ROBOT_DEFAULT_ANGULAR_VEL: number = 0.5
-/** 键盘控制发送间隔（毫秒） */
-export const KEYBOARD_SEND_INTERVAL_MS: number = 100
+export const ROBOT_DEFAULT_ANGULAR_VEL: number = 0.50
+/** 线速度死区（m/s） */
+export const ROBOT_LINEAR_DEADBAND: number = 0.005
+/** 角速度死区（rad/s） */
+export const ROBOT_ANGULAR_DEADBAND: number = 0.010
+/** 控制发送间隔（毫秒，20 Hz）：< stm32_bridge cmd_timeout(0.3s) */
+export const KEYBOARD_SEND_INTERVAL_MS: number = 50
+/** 失焦/可见性变化时主动发停车（ms 内补一次零速） */
+export const FOCUS_LOST_STOP_DELAY_MS: number = 0
 
 // -----------------------------------------------------------------------------
 // 激光雷达可视化配置（3D Livox Mid-360S）

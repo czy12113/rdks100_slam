@@ -105,6 +105,7 @@ class ROS2Bridge:
         try:
             from geometry_msgs.msg import Twist
             from geometry_msgs.msg import PoseStamped
+            from std_msgs.msg import Empty
 
             self._publishers["cmd_vel"] = self._node.create_publisher(
                 Twist, ROS2_TOPIC_CMD_VEL, 10
@@ -112,7 +113,11 @@ class ROS2Bridge:
             self._publishers["goal_pose"] = self._node.create_publisher(
                 PoseStamped, ROS2_TOPIC_GOAL, 10
             )
-            logger.info("[ROS2] 发布者创建完成")
+            # 急停独立通道：与 stm32_bridge 的 cmd_vel_estop 订阅对齐
+            self._publishers["estop"] = self._node.create_publisher(
+                Empty, "/cmd_vel_estop", 10
+            )
+            logger.info("[ROS2] 发布者创建完成（含急停 /cmd_vel_estop）")
         except Exception as e:
             logger.error("[ROS2] 创建发布者失败: %s", e)
 
@@ -276,9 +281,9 @@ class ROS2Bridge:
         输出紧凑格式 [x, y, z, intensity] 减少 JSON 体积
         同时对点数降采样，控制 WebSocket 带宽
 
-        前倾角补偿：
-        雷达安装时绕 Y 轴前倾（LIDAR_MOUNT_PITCH_DEG，前倾为负值），
-        需绕 Y 轴旋转 -pitch_deg 还原为水平坐标系：
+        安装俯仰角补偿：
+        雷达水平安装时 LIDAR_MOUNT_PITCH_DEG=0，不做额外旋转。
+        若现场设置了俯仰角，则绕 Y 轴旋转 -pitch_deg 还原为水平坐标系：
           x' =  x * cos(θ) + z * sin(θ)
           y' =  y
           z' = -x * sin(θ) + z * cos(θ)
@@ -288,14 +293,14 @@ class ROS2Bridge:
         import struct
         import math
 
-        # ── 读取运行时前倾角覆盖值（device.py 运行时配置，热更新无需重启）──────
+        # ── 读取运行时安装俯仰角覆盖值（device.py 运行时配置，热更新无需重启）──────
         try:
             from app.api.device import _runtime_config as _rtcfg
             pitch_deg = float(_rtcfg.get("lidar", {}).get("mount_pitch", LIDAR_MOUNT_PITCH_DEG))
         except Exception:
             pitch_deg = LIDAR_MOUNT_PITCH_DEG
 
-        # 补偿角 = -安装角，即把前倾的坐标系转回水平
+        # 补偿角 = -安装角；水平安装时 pitch_deg=0，因此这里是 no-op
         comp_rad = math.radians(-pitch_deg)
         cos_c = math.cos(comp_rad)
         sin_c = math.sin(comp_rad)
@@ -346,7 +351,7 @@ class ROS2Bridge:
             if dist_xy < 0.02 or dist_xy > 40.0:
                 continue
 
-            # ── 应用前倾角补偿：绕 Y 轴旋转 comp_rad ─────────────────────────
+            # ── 应用安装俯仰角补偿：绕 Y 轴旋转 comp_rad ─────────────────────
             # ROS 坐标系：X=前, Y=左, Z=上；绕 Y 轴旋转只影响 X/Z 分量
             xc = x * cos_c + z * sin_c
             yc = y
@@ -635,18 +640,35 @@ class ROS2Bridge:
     # 控制指令发布
     # -------------------------------------------------------------------------
     def publish_cmd_vel(self, linear_x: float, linear_y: float, angular_z: float):
-        """发布速度控制指令"""
+        """
+        发布速度控制指令（直接转发到 ROS2，不再做限幅）。
+        所有手动/导航来源的限幅、死区、急停锁、watchdog 统一由
+        app.services.safety_gate.safety_gate 完成；本函数只是底层透传。
+        """
         if not self._initialized or "cmd_vel" not in self._publishers:
             return
         try:
             from geometry_msgs.msg import Twist
             msg = Twist()
-            msg.linear.x = float(max(-ROBOT_MAX_LINEAR_VEL, min(ROBOT_MAX_LINEAR_VEL, linear_x)))
-            msg.linear.y = float(max(-ROBOT_MAX_LINEAR_VEL, min(ROBOT_MAX_LINEAR_VEL, linear_y)))
-            msg.angular.z = float(max(-ROBOT_MAX_ANGULAR_VEL, min(ROBOT_MAX_ANGULAR_VEL, angular_z)))
+            msg.linear.x = float(linear_x)
+            msg.linear.y = float(linear_y)
+            msg.angular.z = float(angular_z)
             self._publishers["cmd_vel"].publish(msg)
         except Exception as e:
             logger.error("[ROS2] 发布 cmd_vel 失败: %s", e)
+
+    def publish_estop(self):
+        """
+        通过独立 topic /cmd_vel_estop 触发 stm32_bridge 急停。
+        stm32_bridge 收到该 Empty 消息后会立即连发零速并锁定 0.4s 内的非零 cmd_vel。
+        """
+        if not self._initialized or "estop" not in self._publishers:
+            return
+        try:
+            from std_msgs.msg import Empty
+            self._publishers["estop"].publish(Empty())
+        except Exception as e:
+            logger.error("[ROS2] 发布 estop 失败: %s", e)
 
     def publish_goal(self, x: float, y: float, yaw: float = 0.0):
         """发布导航目标点"""

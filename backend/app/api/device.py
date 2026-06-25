@@ -86,8 +86,8 @@ async def get_config():
             "max_range": LIDAR_MAX_RANGE,
             "min_range": LIDAR_MIN_RANGE,
             "points_per_scan": LIDAR_POINTS_PER_SCAN,
-            # 安装俯仰角（度）：前倾为负，后仰为正
-            # 后端点云解析时会对原始点云做绕 Y 轴的旋转补偿，抵消安装倾斜
+            # 安装俯仰角（度）：水平安装为 0，前倾为负，后仰为正
+            # 默认水平安装，不对原始点云做额外俯仰补偿
             "mount_pitch": LIDAR_MOUNT_PITCH_DEG,
         },
         "imu": {

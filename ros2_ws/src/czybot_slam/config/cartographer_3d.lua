@@ -17,14 +17,10 @@
 -- 特点：利用360S内置IMU + 里程计，生成3D地图和高精度2D投影地图
 -- 适合：复杂室内/室外环境，有坡度的场景
 --
--- ⚠️ 雷达前倾安装说明（pitch=-40°）：
---   base_link→livox_frame 的静态TF已加入 pitch=-40° 旋转补偿（qy=-0.342, qw=0.940）
+-- 雷达水平安装说明：
+--   base_link→livox_frame 的静态TF仅包含安装高度，四元数为单位旋转。
 --   3D模式下 Cartographer 直接消费 /livox/lidar（livox_frame坐标系），
---   TF树会自动将点云从倾斜的 livox_frame 变换到 tracking_frame(base_link)，
---   因此点云匹配和子图构建均在正确的补偿坐标系下进行，无需修改 lua 参数。
---   若使用360S内置IMU（/livox/imu），IMU数据在 livox_frame 坐标系下，
---   Cartographer 会通过相同的 TF 自动将 IMU 加速度/角速度旋转到 tracking_frame，
---   前倾安装对IMU融合的影响已由静态TF完全补偿。
+--   TF树会将点云和IMU数据变换到 tracking_frame(base_link)。
 
 include "map_builder.lua"
 include "trajectory_builder.lua"
