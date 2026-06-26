@@ -19,6 +19,17 @@
   <!-- SLAM / 导航 依赖 -->
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_amcl</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <!-- launch 里使用 nav2_common.launch.RewrittenYaml 注入 BT XML 路径 -->
+  <exec_depend>nav2_common</exec_depend>
+
+  <!-- 雷达 + 点云转激光（导航复用 SLAM 的滤波链）-->
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>pointcloud_to_laserscan</exec_depend>
+  <exec_depend>czybot_slam</exec_depend>
 
   <!-- 可视化 -->
   <exec_depend>rviz2</exec_depend>

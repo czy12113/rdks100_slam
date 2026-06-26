@@ -23,7 +23,7 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-install(DIRECTORY launch maps config scripts
+install(DIRECTORY launch maps config scripts behavior_trees
   DESTINATION share/${PROJECT_NAME}
   USE_SOURCE_PERMISSIONS
 )
@@ -39,5 +39,8 @@ install(PROGRAMS scripts/tjc_demo_publisher.py DESTINATION lib/${PROJECT_NAME} R
 install(PROGRAMS scripts/monitor_stm32.py DESTINATION lib/${PROJECT_NAME} RENAME monitor_stm32)
 install(PROGRAMS scripts/long_monitor.py DESTINATION lib/${PROJECT_NAME} RENAME long_monitor)
 install(PROGRAMS scripts/diagnose_stm32.sh DESTINATION lib/${PROJECT_NAME} RENAME diagnose_stm32)
+install(PROGRAMS scripts/verify_chassis.sh DESTINATION lib/${PROJECT_NAME} RENAME verify_chassis)
+# === 导航命令行 ===
+install(PROGRAMS scripts/send_goal.py DESTINATION lib/${PROJECT_NAME} RENAME send_goal)
 
 ament_package()

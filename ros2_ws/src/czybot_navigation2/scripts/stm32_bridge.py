@@ -31,6 +31,17 @@ STM32 串口通信桥接节点  v5 —— 与 STM32 ChassisParams.h 全面对齐
   max_angular       : 角速度硬限幅 (rad/s)，默认 1.20 与 STM32 对齐
   linear_deadzone   : 线速度死区 (m/s)，低于此值发零速；默认 0.005
   angular_deadzone  : 角速度死区 (rad/s)，低于此值发零速；默认 0.010
+  min_motion_linear : 线速度最小启动门槛 (m/s)，默认 0.18
+                       Nav2 起步阶段 cmd_vel 常在 0.05~0.18 区间，
+                       但电机 + STM32 最小占空比约 0.18 m/s，
+                       小于该值时电机不转。设了之后：
+                       deadzone < |v| < min_motion_linear → 抬到 ±min_motion_linear
+                       关掉则设为 0.0。
+                       注意：只对 linear 做补偿，不对 angular 做（避免舵机抖）。
+  min_motion_angular: 角速度最小启动门槛 (rad/s)，默认 0.0 = 关闭
+                       ⚠ 强烈不建议开启：阿克曼前轮舵机的"小角度低速命令"
+                       是正常 MPPI 输出，硬抬到大值会让舵机左右剧烈抖动。
+                       仅在差速底盘上才考虑打开。
   cmd_timeout       : 无 cmd_vel 多久自动发停车帧 (s)，默认 0.3
                        与 STM32 CMD_TIMEOUT_MS=300 完全对齐
   watchdog_timeout  : 看门狗兜底超时 (s)，默认 0.5
@@ -49,7 +60,7 @@ import serial
 from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from std_msgs.msg import Bool, Empty
+from std_msgs.msg import Bool, Empty, Int32MultiArray
 from tf2_ros import TransformBroadcaster
 
 
@@ -78,6 +89,11 @@ class STM32Bridge(Node):
         self.declare_parameter('max_angular', 1.20)
         self.declare_parameter('linear_deadzone', 0.005)
         self.declare_parameter('angular_deadzone', 0.010)
+        # ★ 真车启动补偿：解决 Nav2 输出 0.10~0.18 m/s 时电机不转的问题
+        # 仅 linear 补偿；angular 补偿在阿克曼上会让前轮舵机剧烈抖动，
+        # 默认关闭（=0.0），如需打开请自行评估。
+        self.declare_parameter('min_motion_linear', 0.18)
+        self.declare_parameter('min_motion_angular', 0.0)
 
         self.declare_parameter('cmd_timeout', 0.3)
         self.declare_parameter('watchdog_timeout', 0.5)
@@ -93,6 +109,8 @@ class STM32Bridge(Node):
         self.max_angular = float(self.get_parameter('max_angular').value)
         self.linear_deadzone = float(self.get_parameter('linear_deadzone').value)
         self.angular_deadzone = float(self.get_parameter('angular_deadzone').value)
+        self.min_motion_linear = float(self.get_parameter('min_motion_linear').value)
+        self.min_motion_angular = float(self.get_parameter('min_motion_angular').value)
 
         self.CMD_TIMEOUT = float(self.get_parameter('cmd_timeout').value)
         self.WATCHDOG_TIMEOUT = float(self.get_parameter('watchdog_timeout').value)
@@ -105,6 +123,9 @@ class STM32Bridge(Node):
         self._max_angular_mrad = int(self.max_angular * 1000)
         self._linear_deadzone_mm = max(1, int(self.linear_deadzone * 1000))
         self._angular_deadzone_mrad = max(1, int(self.angular_deadzone * 1000))
+        # 启动补偿门槛（mm/s, mrad/s）
+        self._min_motion_linear_mm = int(self.min_motion_linear * 1000)
+        self._min_motion_angular_mrad = int(self.min_motion_angular * 1000)
 
         # ── 自动探测串口 ────────────────────────────────────────────────────
         candidate_ports = [port] + [
@@ -142,6 +163,20 @@ class STM32Bridge(Node):
         self._estop_lock_until = 0.0    # 急停锁定结束时刻
         self._lock = threading.Lock()
 
+        # ── 可观测性统计（用于 1 Hz info 日志和 /stm32_bridge/tx_cmd）──────
+        # 现场可用 ros2 topic echo /stm32_bridge/tx_cmd 直接看实际写串口的值，
+        # 避免被 /cmd_vel → bridge → 串口 → STM32 任意一段卡死时无法定位。
+        self._last_rx_time = 0.0     # 最近一次 cmd_vel 回调时间（time.time()）
+        self._last_rx_v = 0          # 最近一次 cmd_vel 入参（限幅+死区+补偿后, mm/s）
+        self._last_rx_w = 0
+        self._last_tx_time = 0.0     # 最近一次实际写串口时间
+        self._last_tx_v = 0
+        self._last_tx_w = 0
+        self._rx_count = 0           # 累计 cmd_vel 回调次数
+        self._tx_count = 0           # 累计 _raw_write 成功次数
+        self._prev_rx_count = 0
+        self._prev_tx_count = 0
+
         # ── ROS2 订阅/发布 ──────────────────────────────────────────────────
         # 主控制通道：cmd_vel
         self.cmd_sub = self.create_subscription(
@@ -153,6 +188,13 @@ class STM32Bridge(Node):
             Bool, 'estop', self._estop_callback_bool, 10)
         # 上行：里程计
         self.odom_pub = self.create_publisher(Odometry, 'odom', 10)
+        # 调试：实际写入串口的速度 [linear_mm/s, angular_mrad/s]
+        # 现场用 `ros2 topic echo /stm32_bridge/tx_cmd` 验证：
+        #   - 没有任何输出   → bridge 完全没向串口写（被死区/急停/超时清零）
+        #   - 输出值非零但车不动 → 问题在串口/STM32/电机/odom 反馈
+        #   - 输出值持续为 0 但 /cmd_vel 非零 → bridge 入口被清零（看 1Hz log）
+        self.tx_cmd_pub = self.create_publisher(
+            Int32MultiArray, 'stm32_bridge/tx_cmd', 10)
 
         if self.publish_tf:
             self.tf_broadcaster = TransformBroadcaster(self)
@@ -178,6 +220,10 @@ class STM32Bridge(Node):
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop, daemon=True, name='stm32_wd')
         self._watchdog_thread.start()
+
+        # 1 Hz 可观测性日志（rx/tx 速率 + 最近值 + 急停锁状态）
+        self._observability_timer = self.create_timer(
+            1.0, self._observability_callback)
 
         self.get_logger().info(
             f'[stm32_bridge v5] 已就绪：限速 v={self.max_linear:.2f}m/s, '
@@ -234,7 +280,24 @@ class STM32Bridge(Node):
         if abs(angular_mrad) < self._angular_deadzone_mrad:
             angular_mrad = 0
 
+        # ★ 启动补偿（kickstart）：
+        # 死区之外但低于电机最小启动门槛的值，统一抬到门槛值，
+        # 否则 Nav2 在 0.10~0.18 m/s 命令下电机会原地卡死。
+        # 仅对 linear 做：angular 补偿会让阿克曼前轮舵机抖动（实测有效）。
+        if self._min_motion_linear_mm > 0 and 0 < abs(linear_mm) < self._min_motion_linear_mm:
+            linear_mm = self._min_motion_linear_mm if linear_mm > 0 else -self._min_motion_linear_mm
+        # angular 默认关闭补偿（min_motion_angular=0.0）。如需开启，
+        # 在 launch 显式设置 min_motion_angular > 0.0
+        if self._min_motion_angular_mrad > 0 and 0 < abs(angular_mrad) < self._min_motion_angular_mrad:
+            angular_mrad = self._min_motion_angular_mrad if angular_mrad > 0 else -self._min_motion_angular_mrad
+
         with self._lock:
+            # 可观测性：无论是否被急停清零，都先记录"上层确实送来了命令"
+            self._last_rx_time = now
+            self._last_rx_v = linear_mm
+            self._last_rx_w = angular_mrad
+            self._rx_count += 1
+
             if now < self._estop_lock_until:
                 # 急停锁定中：强制零速，不更新 last_cmd_time，
                 # 这样如果上层一直发非零速，watchdog 仍会兜底。
@@ -340,10 +403,66 @@ class STM32Bridge(Node):
         cmd = self.build_control_cmd(linear_vel, angular_vel)
         try:
             self.serial.write(cmd)
+            # 发布 debug topic：实际进入串口的整数速度
+            try:
+                tx_msg = Int32MultiArray()
+                tx_msg.data = [int(linear_vel), int(angular_vel)]
+                self.tx_cmd_pub.publish(tx_msg)
+            except Exception:
+                # 发布失败不影响串口主链路
+                pass
+            with self._lock:
+                self._last_tx_time = time.time()
+                self._last_tx_v = int(linear_vel)
+                self._last_tx_w = int(angular_vel)
+                self._tx_count += 1
             self.get_logger().debug(
                 f'[TX] linear={linear_vel} mm/s, angular={angular_vel} mrad/s')
         except Exception as e:
             self.get_logger().error(f'[TX] 串口写入失败: {e}')
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 1 Hz 可观测性日志
+    # ────────────────────────────────────────────────────────────────────────
+    def _observability_callback(self):
+        """
+        每秒打印一次：rx/tx 速率、最近 cmd_vel 入参、最近写串口值、急停锁状态。
+        现场用这条日志可以快速区分三种"车不动"故障：
+          - rx=0/s  → bridge 根本没收到 /cmd_vel（话题/QoS/重映射问题）
+          - rx>0 但 last_rx 长时间为 0 → 上层在发零速（Nav2 失败/前端误发）
+          - rx>0、last_rx 非零，但 tx=0/s → 入口被死区/急停/超时清零
+          - rx>0、tx>0 但车不动 → 问题在串口下游（STM32/电机/odom）
+        """
+        now = time.time()
+        with self._lock:
+            rx_count = self._rx_count
+            tx_count = self._tx_count
+            last_rx_v = self._last_rx_v
+            last_rx_w = self._last_rx_w
+            last_rx_t = self._last_rx_time
+            last_tx_v = self._last_tx_v
+            last_tx_w = self._last_tx_w
+            last_tx_t = self._last_tx_time
+            latest_v = self.latest_linear
+            latest_w = self.latest_angular
+            estop_locked = now < self._estop_lock_until
+
+        drx = rx_count - self._prev_rx_count
+        dtx = tx_count - self._prev_tx_count
+        self._prev_rx_count = rx_count
+        self._prev_tx_count = tx_count
+
+        rx_age = (now - last_rx_t) if last_rx_t > 0 else -1.0
+        tx_age = (now - last_tx_t) if last_tx_t > 0 else -1.0
+
+        self.get_logger().info(
+            f'[OBS] rx={drx}/s(total={rx_count}) '
+            f'last_rx=(v={last_rx_v}mm/s,w={last_rx_w}mrad/s,age={rx_age:.2f}s) | '
+            f'tx={dtx}/s(total={tx_count}) '
+            f'last_tx=(v={last_tx_v}mm/s,w={last_tx_w}mrad/s,age={tx_age:.2f}s) | '
+            f'latest=(v={latest_v},w={latest_w}) '
+            f'estop_lock={estop_locked}'
+        )
 
     # ────────────────────────────────────────────────────────────────────────
     # 看门狗线程

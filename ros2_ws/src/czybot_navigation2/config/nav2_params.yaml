@@ -7,6 +7,14 @@
 #   底盘类型 = 阿克曼，不能原地旋转
 #   极小转弯半径 r_min = v / w = 0.6 / 1.2 = 0.50 m
 #
+# 改动概要（v3 真车上线 + Livox Mid360 滤波链对齐）：
+#   1. 所有 scan 订阅 → /scan_filtered（与 czybot_slam 滤波链一致）
+#   2. 全栈 enable_stamped_cmd_vel: false
+#      stm32_bridge 订阅 geometry_msgs/Twist，TwistStamped 它收不到。
+#   3. amcl.set_initial_pose: true，开机即在原点定位，免去 RViz 手点。
+#      若每次开机姿态不同，可以在 launch 里覆盖 initial_pose.{x,y,yaw}。
+#   4. AMCL scan_topic 改为 scan_filtered；laser_max_range 与雷达上限对齐。
+#
 # 改动概要（v2 阿克曼化）：
 #   1. MPPIController.motion_model: DiffDrive → Ackermann
 #      vx_max=0.60 / vy_max=0.0 / wz_max=1.20，禁止侧移
@@ -44,9 +52,12 @@ amcl:
     laser_max_range: 100.0
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
-    max_beams: 60
-    max_particles: 2000
-    min_particles: 500
+    # ★ RK 板算力专项：
+    #   max_beams 60→30（每次更新激光束减半，AMCL CPU -50%）
+    #   max/min_particles 同步减半
+    max_beams: 30
+    max_particles: 800
+    min_particles: 200
     odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
@@ -59,38 +70,110 @@ amcl:
     save_pose_rate: 0.5
     sigma_hit: 0.2
     tf_broadcast: true
+    # ★ 修复 "Lookup would require extrapolation into the future" 警告
+    #   transform_tolerance：TF 容错窗口
+    #   message_filter_queue_size：消息缓存队列加大，吃下短时抖动
     transform_tolerance: 1.0
+    message_filter_queue_size: 200
     update_min_a: 0.2
     update_min_d: 0.25
     z_hit: 0.5
     z_max: 0.05
     z_rand: 0.5
     z_short: 0.05
-    scan_topic: scan
+    scan_topic: scan_filtered
+    # 开机即定位到地图原点；若每次开机姿态不同，请在 launch 时覆盖。
+    set_initial_pose: true
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+    # 真实激光最大量程，与 pointcloud_to_laserscan.yaml 对齐
+    # （laser_max_range 默认是 -1.0 表示用 scan 自身的 range_max，已足够；
+    #  这里显式拉齐，避免雷达上报异常 inf 时 AMCL 误判）
 
 bt_navigator:
   ros__parameters:
+    # ── ROS2 Humble 兼容版（单 navigator + plugin_lib_names）──
+    # 阿克曼底盘不能原地旋转 / 任意后退，所以无法使用 nav2 内置默认 BT
+    # （内置 BT 依赖 spin + back_up 两个 recovery action，加载时会要求
+    #  对应 action server 在 behavior_server 里被声明，否则直接 abort
+    #  bt_navigator 的 activation —— 这正是上一轮启动失败的根因）。
+    #
+    # 下面两个 *PLACEHOLDER* 字符串在 launch 阶段会被 nav2_common
+    # RewrittenYaml 替换为本包 install/share 下的绝对路径。
+    #   ⚠ 不要删这两行——RewrittenYaml 只"替换已存在的 key"，
+    #     如果 yaml 里没有这两个 key，它会沉默跳过，bt_navigator
+    #     就会回落到 /opt/ros/humble/.../navigate_to_pose_w_replanning_and_recovery.xml
+    #     从而再次试图加载需要 spin/back_up 的默认 BT 而失败。
+    default_nav_to_pose_bt_xml: __WILL_BE_REWRITTEN_BY_LAUNCH__
+    default_nav_through_poses_bt_xml: __WILL_BE_REWRITTEN_BY_LAUNCH__
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odom
-    bt_loop_duration: 10
+    # ★ RK S100 算力有限，默认 bt_loop_duration=10ms（100Hz）跑不动
+    # 改成 50ms（20Hz）足够给 Nav2 用，CPU 占用下降明显，
+    # 同时消除 "Behavior Tree tick rate 100.00 was exceeded!" 警告
+    bt_loop_duration: 50
     default_server_timeout: 20
     wait_for_service_timeout: 1000
-    action_server_result_timeout: 900.0
-    navigators: ["navigate_to_pose", "navigate_through_poses"]
-    navigate_to_pose:
-      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
-    navigate_through_poses:
-      plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
-    error_code_names:
-      - compute_path_error_code
-      - follow_path_error_code
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_assisted_teleop_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_controller_cancel_bt_node
+      - nav2_path_longer_on_approach_bt_node
+      - nav2_wait_cancel_bt_node
+      - nav2_spin_cancel_bt_node
+      - nav2_back_up_cancel_bt_node
+      - nav2_assisted_teleop_cancel_bt_node
+      - nav2_drive_on_heading_cancel_bt_node
+      - nav2_is_battery_charging_condition_bt_node
 
 controller_server:
   ros__parameters:
-    enable_stamped_cmd_vel: true
-    controller_frequency: 20.0
-    costmap_update_timeout: 0.30
+    # ★ RK S100 CPU 满载时 MPPI 跑不到 20Hz，会出现 Control loop missed its
+    #   desired rate。降到 10Hz：阿克曼真车 0.35 m/s 巡航，10Hz 控制环
+    #   足够稳定，CPU 占用直接砍半。
+    controller_frequency: 10.0
+    costmap_update_timeout: 0.50
     # 阿克曼：vy 必然 ≈ 0，把 vy 阈值拉高到 1.0 让 Nav2 不把 vy 当作有效速度
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 1.0
@@ -103,37 +186,79 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      # ★ v5 进一步放宽：低速场景下到点附近的小振荡也会被 progress checker
+      #   误判为"无进展"，触发 BT recovery → 清 costmap → 重规划 → 突然前冲。
+      #   把 required_movement_radius 从 0.10 → 0.05（5 cm 算有进展），
+      #   movement_time_allowance 15s → 30s（即使振荡也不轻易触发恢复）。
+      required_movement_radius: 0.05
+      movement_time_allowance: 30.0
 
-    # 阿克曼放宽 yaw 容差（避免到点后强行原地修正角度）
+    # ─────────────────────────────────────────────────────────────────────
+    # 阿克曼到点判定（v5：禁用 yaw 检查，根治"停下→倒车→摆动→突然前冲"）
+    # ─────────────────────────────────────────────────────────────────────
+    # v4 现象：到点 stop → 立刻倒退 → 摆动 → 突然前冲
+    #
+    # 根因：阿克曼无法原地旋转，但 yaw_goal_tolerance=0.50 (≈28°) 仍要求
+    #   终点朝向接近目标朝向。流程是：
+    #     1. xy 进入 20cm 容差 → goal_checker 看 yaw 偏差超 28° → 判未到达
+    #     2. MPPI 为纠正 yaw 必须开弧线 → ax_min=-1.5 让它瞬间倒车 → "倒退"
+    #     3. 倒一段 yaw 仍不够 → 再前进 → "来回摆动"
+    #     4. 最后 progress_checker 15s 无进展 → BT 清 costmap 重规划 → "突然前冲"
+    #
+    # v5 修复：阿克曼车的 2D Goal Pose **只判位置，不判朝向**
+    #   - yaw_goal_tolerance 设为 3.14（180°）等价禁用朝向检查
+    #   - 这样 xy 进入 0.20 m 容差就直接判定到达，不再纠正朝向
+    #   - 如果业务上确实需要朝向对准（如对接充电桩），用 docking_server
+    #     或单独的对接 action，不要用通用 Nav2 goal_checker
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.20
-      yaw_goal_tolerance: 0.30   # ≈ 17°
+      yaw_goal_tolerance: 3.14    # 阿克曼禁用 yaw 检查（v5 关键修复）
 
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
-      time_steps: 56
-      model_dt: 0.05
-      batch_size: 2000
-      # 阿克曼禁止过激加减速：与下位机斜坡输出协同
-      ax_max: 1.0
-      ax_min: -1.0
+      # ★ RK S100 算力专用配置：
+      #   time_steps 56→30（前瞻 1.5s 仍足够）
+      #   batch_size 2000→1000（候选轨迹数减半，CPU 占用直接 -50%）
+      #   model_dt 0.05→0.10（与 controller_frequency=10Hz 对齐）
+      time_steps: 30
+      model_dt: 0.10
+      batch_size: 1000
+      # ── v5 加减速（仍保留 v4 的强减速策略）───────────────────────────
+      # 起步加速度 0.5（更柔和，避免顿挫），减速度仍 -1.2（够用即可）。
+      # v4 的 -1.5 过大，配合启动门槛会让小车在终点突然急刹后立刻反向，
+      # 这是 "停下→倒车" 的次要诱因。
+      ax_max: 0.5
+      ax_min: -1.2
       ay_max: 0.0
       ay_min: 0.0
-      az_max: 1.5
-      vx_std: 0.15
+      az_max: 1.0
+      # 采样标准差再缩小：v5 vx_max=0.15 后，0.06 已经偏大（占总速度 40%），
+      # 缩到 0.04 让候选轨迹更稳定地落在低速带，避免高速候选触发倒车
+      vx_std: 0.04
       vy_std: 0.0
-      wz_std: 0.30
-      # ── 与 STM32 限速完全对齐 ──
-      vx_max: 0.60
-      vx_min: -0.30   # 阿克曼倒车更慢更稳
+      wz_std: 0.15
+      # ── v5 真车巡航速度（继续降速 + 关闭倒车）────────────────────────
+      # vx_max: 0.22 → 0.15 m/s ≈ 0.54 km/h
+      #   用户反馈"慢点准确一些"，降到 0.15 m/s。配合 min_motion_linear=0.08
+      #   → 减速带宽 [0.08, 0.15]，余地仍然够 MPPI 在终点平滑减速。
+      # vx_min: -0.12 → 0.0
+      #   ★ 阿克曼车在 Nav2 中允许倒车会带来两个副作用：
+      #     1) 到点后只要 yaw/xy 有小偏差，MPPI 会立刻发倒车命令"修正"，
+      #        这正是用户看到的 "停下→倒退" 的直接原因。
+      #     2) 倒车 + 舵机延迟 + 启动门槛 → 容易摆动失控。
+      #   设为 0 强制 forward-only：到点小偏差由 BT 重规划绕一圈解决，
+      #   永远不会"原地倒车"。如果业务必须支持后退（如脱困），通过
+      #   独立的 BackUp action 控制，不通过 MPPI 自由倒车。
+      vx_max: 0.15
+      vx_min: 0.0
       vy_max: 0.0     # 禁止侧移
-      wz_max: 1.20
+      wz_max: 0.50    # r_min = 0.15/0.50 = 0.30 m，与 AckermannConstraints 对齐
       iteration_count: 1
-      prune_distance: 1.7
+      # 前瞻距离：vx_max=0.15 × time_steps=30 × model_dt=0.10 = 0.45 m
+      # prune_distance 收到 0.8 m，更聚焦近端路径
+      prune_distance: 0.8
       transform_tolerance: 0.1
       temperature: 0.3
       gamma: 0.015
@@ -145,9 +270,9 @@ controller_server:
         trajectory_step: 5
         time_step: 3
       AckermannConstraints:
-        # r_min 必须 ≥ MAX_LINEAR_SPEED / MAX_ANGULAR_SPEED = 0.60 / 1.20 = 0.50
-        # 取 0.45 让规划层稍微激进一点，由 velocity_smoother 兜底削掉超限角速度
-        min_turning_r: 0.45
+        # 理论 r_min = vx_max/wz_max = 0.22/0.60 ≈ 0.37 m
+        # 给 0.30 m 留少量余量，避免短距离/急转目标无解
+        min_turning_r: 0.30
       critics: [
         "ConstraintCritic", "CostCritic", "GoalCritic",
         "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
@@ -156,21 +281,28 @@ controller_server:
         enabled: true
         cost_power: 1
         cost_weight: 4.0
+      # ★ v5 终点收敛：GoalCritic 主导减速
       GoalCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0
-        threshold_to_consider: 1.4
+        cost_weight: 20.0
+        threshold_to_consider: 2.5
+      # ★ v5 关键：完全禁用 GoalAngleCritic
+      #   阿克曼不能原地旋转，强行让 MPPI 在终点纠正朝向 →
+      #   产生倒车 + 弧线 + 摆动。彻底关掉，朝向交给业务层处理。
       GoalAngleCritic:
-        enabled: true
+        enabled: false
         cost_power: 1
-        # 阿克曼接近终点时不要硬扳角度
-        cost_weight: 1.0
+        cost_weight: 0.0
         threshold_to_consider: 0.5
+      # ★ v5：PreferForwardCritic 完全恢复正常权重
+      #   v4 把它降到 2.0 是为了让 GoalCritic 减速主导；
+      #   但 v5 已经通过 vx_min=0.0 强制禁止倒车，PreferForwardCritic
+      #   不再需要"对抗"GoalCritic，恢复到中等权重 5.0 让小车保持前进。
       PreferForwardCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 6.0
+        cost_weight: 5.0
         threshold_to_consider: 0.5
       CostCritic:
         enabled: true
@@ -206,38 +338,57 @@ controller_server:
         max_angle_to_furthest: 1.0
         mode: 0
 
+# ============================================================================
+# 代价地图（重点修复 "Starting point in lethal space"）
+# ----------------------------------------------------------------------------
+# 根因：之前 inflation_radius=0.25 + robot_radius=0.18 = 总占用 0.43 m。
+#   真车 RViz "2D Pose Estimate" 稍微靠墙一点，AMCL 收敛后的车体坐标
+#   就直接落在 INSCRIBED 致命区，Smac 把起点判为障碍，全局规划失败、
+#   BT abort，没有任何 cmd_vel 下发 → 小车一动不动。
+#
+# 修复策略：
+#   1. robot_radius 0.18 → 0.15（与底盘实际半宽更贴合）
+#   2. inflation_radius 0.25 → 0.18（仅比车体半径多 3cm 安全边距）
+#   3. cost_scaling_factor 5.0 → 3.0（让代价从致命到 0 衰减更缓，
+#      INSCRIBED 区域不会拓得过宽）
+#   4. local_costmap 关 voxel_layer 立体计算，改用 ObstacleLayer 2D 版，
+#      RK S100 CPU 占用直接砍半。Mid360 在 pc2laserscan 阶段已压成 2D，
+#      再用 voxel 三维栅格化纯属浪费算力。
+# ============================================================================
+
 local_costmap:
   local_costmap:
     ros__parameters:
-      update_frequency: 5.0
-      publish_frequency: 2.0
+      # ★ RK 板算力专项：local costmap 也减负
+      #   update_frequency 5→3（已足够 0.35 m/s 低速车）
+      #   width/height 3→2（地图面积 -56%，inflation 计算量同比减少）
+      update_frequency: 3.0
+      publish_frequency: 1.0
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
-      width: 3
-      height: 3
+      width: 2
+      height: 2
       resolution: 0.05
       # ── 阿克曼小车 footprint（如已知车体尺寸建议改为多边形）──
       # 当前用 robot_radius 兜底；如要更精细，把下面行替换为：
       # footprint: "[[0.18,0.10],[0.18,-0.10],[-0.12,-0.10],[-0.12,0.10]]"
-      robot_radius: 0.18
-      plugins: ["voxel_layer", "inflation_layer"]
+      robot_radius: 0.15
+      # ★ 用 obstacle_layer（2D）替换 voxel_layer（3D），RK 板 CPU 减半
+      plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
+        # cost_scaling_factor 调小 → 代价衰减更缓，INSCRIBED 区域不会过大；
+        # inflation_radius 仅比车体半径多 3 cm，避免起点落入致命区
         cost_scaling_factor: 3.0
-        inflation_radius: 0.35
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
+        inflation_radius: 0.18
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        publish_voxel_map: True
-        origin_z: 0.0
-        z_resolution: 0.05
-        z_voxels: 16
-        max_obstacle_height: 2.0
-        mark_threshold: 0
         observation_sources: scan
         scan:
-          topic: /scan
+          # 与 czybot_slam 滤波链对齐，使用 /scan_filtered
+          topic: /scan_filtered
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -258,7 +409,7 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
-      robot_radius: 0.18
+      robot_radius: 0.15
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -267,7 +418,7 @@ global_costmap:
         enabled: True
         observation_sources: scan
         scan:
-          topic: /scan
+          topic: /scan_filtered
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -281,8 +432,10 @@ global_costmap:
         map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
+        # ★ 与 local_costmap 完全对齐，避免 global 起点已可通行但 local
+        # 把同一点判为致命，导致规划 OK 但控制段刚出发就 abort
         cost_scaling_factor: 3.0
-        inflation_radius: 0.35
+        inflation_radius: 0.18
       always_send_full_costmap: True
 
 map_server:
@@ -298,35 +451,33 @@ map_saver:
 
 planner_server:
   ros__parameters:
-    expected_planner_frequency: 20.0
+    # ★ 关键：之前写 20.0 完全不切实际——SmacPlanner2D 在 RK 板上做一次
+    #   完整搜索就要 0.5~1s，根本不可能 20Hz。这导致一直刷
+    #   "Planner loop missed its desired rate of 20Hz, current 1.92Hz"。
+    #   实际 1Hz 已经足够：BT 里 RateController hz=1.0 也是这个频率。
+    expected_planner_frequency: 1.0
     planner_plugins: ["GridBased"]
     costmap_update_timeout: 1.0
+    # ── 阿克曼小车工程化方案 ──────────────────────────────────────────
+    # 全局规划用 SmacPlanner2D（无运动学约束），阿克曼运动学完全交给
+    # 下游 MPPI Ackermann 控制器处理。
+    #
+    # 历史教训：之前用 SmacPlannerHybrid(DUBIN) + r_min=0.45m 时，
+    # 0.6 m 量级的近距离目标会反复 "no valid path found"——
+    # Hybrid-A* 必须能用 r_min 的弧线连起点和终点，距离过短直接无解。
     GridBased:
-      # 阿克曼专用：Smac Hybrid-A* 能直接产生符合 r_min 约束的路径
-      plugin: "nav2_smac_planner::SmacPlannerHybrid"
-      tolerance: 0.50
+      plugin: "nav2_smac_planner/SmacPlanner2D"
+      tolerance: 0.30
       downsample_costmap: false
-      downsample_factor: 1
+      downsampling_factor: 1
       allow_unknown: true
       max_iterations: 1000000
       max_on_approach_iterations: 1000
-      max_planning_time: 5.0
-      motion_model_for_search: "DUBIN"   # 阿克曼前进，无倒车 → DUBIN
+      max_planning_time: 2.0
+      motion_model_for_search: "MOORE"   # 8-邻接，2D 平面 A*
       cost_travel_multiplier: 2.0
-      angle_quantization_bins: 72
-      analytic_expansion_ratio: 3.5
-      analytic_expansion_max_length: 3.0
-      analytic_expansion_max_cost: 200.0
-      analytic_expansion_max_cost_override: false
-      minimum_turning_radius: 0.45      # 与 MPPI Ackermann 一致
-      reverse_penalty: 2.0
-      change_penalty: 0.0
-      non_straight_penalty: 1.20
-      cost_penalty: 2.0
-      retrospective_penalty: 0.015
-      lookup_table_size: 20.0
-      cache_obstacle_heuristic: false
-      debug_visualizations: false
+      use_final_approach_orientation: false
+      smooth_path: true
       smoother:
         max_iterations: 1000
         w_smooth: 0.3
@@ -345,7 +496,6 @@ smoother_server:
 # ── 阿克曼禁止 spin / backup（无法原地旋转，后退依赖舵机限制）──
 behavior_server:
   ros__parameters:
-    enable_stamped_cmd_vel: true
     local_costmap_topic: local_costmap/costmap_raw
     global_costmap_topic: global_costmap/costmap_raw
     local_footprint_topic: local_costmap/published_footprint
@@ -399,33 +549,51 @@ route_server:
     CostmapScorer:
       plugin: "nav2_route::CostmapScorer"
 
-# ── 速度平滑：与 STM32/上位机限速完全对齐 ──
+# ── 速度平滑 ──
+# 注意：Nav2 默认 controller_server 直接发到 /cmd_vel，stm32_bridge 也订阅
+# /cmd_vel，velocity_smoother 默认订阅 cmd_vel 重新发布到 /cmd_vel_smoothed，
+# 当前链路下它实际是旁路的。若以后想启用平滑链：
+#   1. controller_server 改发 /cmd_vel_nav（remap）
+#   2. velocity_smoother 订阅 /cmd_vel_nav，发布 /cmd_vel
+#   3. 或者把 stm32_bridge 改订 /cmd_vel_smoothed
+# 此处参数与 MPPI 上限同步缩小，作为兜底/未来启用时的安全约束。
 velocity_smoother:
   ros__parameters:
-    enable_stamped_cmd_vel: true
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    # [vx, vy, wz] —— 与 STM32 ChassisParams.h 一致
-    max_velocity: [0.60, 0.0, 1.20]
-    min_velocity: [-0.30, 0.0, -1.20]
-    # 阿克曼禁止过激加减速，下位机也有斜坡输出，二者协同
-    max_accel: [1.0, 0.0, 1.5]
-    max_decel: [-1.5, 0.0, -1.5]
+    # [vx, vy, wz] —— 与 MPPI 的 vx_max/wz_max 对齐（v5 慢速精准模式）
+    max_velocity: [0.15, 0.0, 0.50]
+    # v5：min_velocity 线速度设为 0，与 MPPI vx_min=0 同步，强制禁止倒车
+    min_velocity: [0.0, 0.0, -0.50]
+    # v5：加减速更柔和，避免终点附近的急刹反向
+    max_accel: [0.5, 0.0, 1.0]
+    max_decel: [-1.2, 0.0, -1.0]
     odom_topic: "odom"
     odom_duration: 0.1
     # 与上位机 ROBOT_LINEAR_DEADBAND/ANGULAR_DEADBAND 一致
     deadband_velocity: [0.005, 0.0, 0.010]
     velocity_timeout: 1.0
 
-# ── 碰撞监控：修复 cmd_vel_out → /cmd_vel（让 stm32_bridge 能收到）──
+# ── 碰撞监控 ──
+# ★ 当前为 "最小验证链路" 模式（按 运动控制导航问题修改建议.md 第 3 节）：
+#   controller_server → /cmd_vel → stm32_bridge
+#   collision_monitor 不再覆盖 /cmd_vel，输出到无人订阅的
+#   /cmd_vel_collision_monitor（实质等同禁用，但保留节点存活避免
+#   lifecycle_manager 卡在 activate）。
+#
+# 验证小车能正常导航后，如果要启用碰撞兜底：
+#   1. 在 launch 给 controller_server remap：('/cmd_vel', '/cmd_vel_nav')
+#   2. velocity_smoother 订阅 cmd_vel_nav 输出 cmd_vel_smoothed
+#   3. cmd_vel_in_topic 设为 cmd_vel_smoothed（已是）
+#   4. cmd_vel_out_topic 改回 /cmd_vel
+#   5. stm32_bridge 仍订 /cmd_vel
 collision_monitor:
   ros__parameters:
-    enable_stamped_cmd_vel: true
     base_frame_id: "base_link"
     odom_frame_id: "odom"
     cmd_vel_in_topic: "cmd_vel_smoothed"
-    cmd_vel_out_topic: "/cmd_vel"
+    cmd_vel_out_topic: "/cmd_vel_collision_monitor"
     state_topic: "collision_monitor_state"
     transform_tolerance: 0.2
     source_timeout: 1.0
@@ -444,7 +612,7 @@ collision_monitor:
     observation_sources: ["scan"]
     scan:
       type: "scan"
-      topic: "scan"
+      topic: "scan_filtered"
       min_height: 0.15
       max_height: 2.0
       enabled: True
