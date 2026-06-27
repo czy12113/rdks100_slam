@@ -303,6 +303,28 @@ function velBarClass(val: number) {
 const JOYSTICK_DEADZONE = 0.08
 const JOYSTICK_SIZE     = 140
 /**
+ * v11.0：摇杆轴吸附阈值（±15°）
+ *
+ * 现象：触屏 / 鼠标拖摇杆几乎无法精准对准 90°，几度偏角就给出一个
+ * 稳定的小 angular.z（如 ~0.07 rad/s），导致 Ackermann 底盘"前进时
+ * 持续小角度转弯"走圈。
+ *
+ * 修复：靠近 0 / π/2 / π / 3π/2（即 D-pad 四方向）时，强制吸附到
+ * 正交轴。允许的有效角度区间是 [c-15°, c+15°]，超出阈值才按真实
+ * 角度计算 vx / wz 分量。
+ *
+ * 15° 是用户体验经验值：太小（< 10°）用户感觉"摇杆失灵"，
+ * 太大（> 20°）会失去斜向运动能力。
+ */
+const JOYSTICK_SNAP_RAD = Math.PI / 12   // 15°
+const JOYSTICK_CARDINALS = [
+  0,                  // 右（纯右转）
+  Math.PI / 2,        // 上（纯前进）
+  Math.PI,            // 左（纯左转）
+  3 * Math.PI / 2,    // 下（纯后退）
+  2 * Math.PI,        // 右（跨周回环，等价于 0）
+]
+/**
  * 发送间隔 50ms（20Hz）
  * stm32_bridge CMD_TIMEOUT=0.5s，50ms 轮询远小于超时阈值，不会触发误停车
  */
@@ -387,7 +409,18 @@ function initJoystick() {
       return
     }
     const mappedForce = (force - JOYSTICK_DEADZONE) / (1 - JOYSTICK_DEADZONE)
-    const angle = data.angle.radian
+    let angle = data.angle.radian
+
+    // v11.0：四方向轴吸附（±15°）
+    // 靠近 0 / π/2 / π / 3π/2 时强制贴到正交轴，杜绝
+    // 触屏拖摇杆时几度偏角导致的"前进时持续微转弯"走圈。
+    for (const c of JOYSTICK_CARDINALS) {
+      if (Math.abs(angle - c) <= JOYSTICK_SNAP_RAD) {
+        angle = c
+        break
+      }
+    }
+
     targetVx =  Math.sin(angle) * mappedForce * linearSpeed.value
     targetWz = -Math.cos(angle) * mappedForce * angularSpeed.value
   })

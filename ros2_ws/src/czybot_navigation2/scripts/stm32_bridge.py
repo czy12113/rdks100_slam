@@ -30,7 +30,17 @@ STM32 串口通信桥接节点  v5 —— 与 STM32 ChassisParams.h 全面对齐
   max_linear        : 线速度硬限幅 (m/s)，默认 0.60 与 STM32 对齐
   max_angular       : 角速度硬限幅 (rad/s)，默认 1.20 与 STM32 对齐
   linear_deadzone   : 线速度死区 (m/s)，低于此值发零速；默认 0.005
-  angular_deadzone  : 角速度死区 (rad/s)，低于此值发零速；默认 0.010
+  angular_deadzone  : 角速度死区 (rad/s)，低于此值发零速；默认 0.002（v11.0）
+                       v11 前为 0.010，但配合 vx_max=0.10 / wz_max=0.33 后，
+                       1° 朝向修正只需要 ω≈0.017 rad/s，0.010 死区会把
+                       MPPI 的小角度修正命令吃掉一大半（这是"只直走、
+                       不拐小角度"的 ROS 侧第一道死区）。
+                       0.002 rad/s ≈ 0.11°/s，远低于舵机分辨率门槛，
+                       不会引起舵机抖动，但能把所有有意义的微转向命令
+                       透传到 STM32。
+                       ⚠ STM32 端 ChassisParams.h: ANGULAR_DEADBAND 默认
+                       0.03 rad/s 是第二道死区，需要在 Keil 同步降到
+                       0.005 才能彻底解锁小角度修正。
   min_motion_linear : 线速度最小启动门槛 (m/s)，默认 0.18
                        Nav2 起步阶段 cmd_vel 常在 0.05~0.18 区间，
                        但电机 + STM32 最小占空比约 0.18 m/s，
@@ -88,7 +98,8 @@ class STM32Bridge(Node):
         self.declare_parameter('max_linear', 0.60)
         self.declare_parameter('max_angular', 1.20)
         self.declare_parameter('linear_deadzone', 0.005)
-        self.declare_parameter('angular_deadzone', 0.010)
+        # v11.0：angular_deadzone 默认 0.010 → 0.002（详见文件头注释）
+        self.declare_parameter('angular_deadzone', 0.002)
         # ★ 真车启动补偿：解决 Nav2 输出 0.10~0.18 m/s 时电机不转的问题
         # 仅 linear 补偿；angular 补偿在阿克曼上会让前轮舵机剧烈抖动，
         # 默认关闭（=0.0），如需打开请自行评估。

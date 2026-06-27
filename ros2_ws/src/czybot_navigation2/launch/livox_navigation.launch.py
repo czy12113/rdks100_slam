@@ -217,15 +217,26 @@ def generate_launch_description():
             default_value='0.005',
             description='线速度死区 (m/s)，低于此值视为 0',
         ),
+        # v11.0：angular_deadzone 默认 0.010 → 0.002
+        # 解决"只直走、不拐小角度"中 ROS 侧第一道死区把 MPPI 微转向
+        # 命令清零的问题（1° 修正只需 ω≈0.017 rad/s，落在 0.010 死区内）。
+        # STM32 端 ANGULAR_DEADBAND=0.03 是第二道死区，需在 Keil 同步降到
+        # 0.005 才能彻底解锁。详见 运动控制导航问题修改建议.md v11.0 节。
         DeclareLaunchArgument(
             'stm32_angular_deadzone',
-            default_value='0.010',
-            description='角速度死区 (rad/s)，低于此值视为 0',
+            default_value='0.002',
+            description='角速度死区 (rad/s)，v11.0 起降到 0.002 以解锁小角度修正',
         ),
         # 与 SLAM launch 完全相同的雷达外参与滤波链参数，便于复用调参成果
         DeclareLaunchArgument('lidar_x', default_value='0.0'),
         DeclareLaunchArgument('lidar_y', default_value='0.0'),
-        DeclareLaunchArgument('lidar_z', default_value='0.15'),
+        # ★ v6.3 修正：Livox Mid-360S 离地实测 0.25 m（之前 0.15 m 是过时值）
+        #   注意：这是 base_link → livox_frame 的静态 TF Z 偏移。
+        #   base_link 默认在车轮接地面（z=0），雷达水平扫描层因此落在地图 z=0.25。
+        #   修正后 RViz 中雷达可视化位置与车体实际安装位置一致；
+        #   对 2D 导航的避障决策无功能性影响（投影到 z=0 后的 LaserScan 不变）。
+        #   如车架结构变动导致雷达高度变化，请通过命令行参数 lidar_z:=<新值> 覆盖。
+        DeclareLaunchArgument('lidar_z', default_value='0.25'),
         DeclareLaunchArgument('lidar_qx', default_value='0.0'),
         DeclareLaunchArgument('lidar_qy', default_value='0.0'),
         DeclareLaunchArgument('lidar_qz', default_value='0.0'),
@@ -260,6 +271,23 @@ def generate_launch_description():
         executable='stm32_bridge',
         name='stm32_bridge',
         output='screen',
+        # ★ v6.2 回退：stm32_bridge 直接订阅 /cmd_vel
+        # ────────────────────────────────────────────────────────
+        # v6 曾尝试 remap 到 /cmd_vel_safe 想把 collision_monitor 串入
+        # 控制链。但 nav2_bringup 的默认 lifecycle 列表里并不包含
+        # collision_monitor（它是独立的 nav2_collision_monitor 包，
+        # 需要单独 launch 并由 lifecycle_manager 接管才会激活）。
+        # 这导致 /cmd_vel_safe 没有任何发布者，stm32_bridge 永远收不到
+        # 速度命令，小车不动。
+        # v6.2 回退到最小可动链路：
+        #   controller_server → /cmd_vel → stm32_bridge → STM32
+        # MPPI 自身的避障由 CostCritic（cost_weight=18.0 + critical_cost=220
+        # + inflation_radius=0.40）保证。
+        # 如未来要真正启用 collision_monitor 物理避障兜底，需要：
+        #   1. 在 launch 里单独 Node(package='nav2_collision_monitor',...)
+        #   2. 把 collision_monitor 加进 lifecycle_manager_navigation 的
+        #      node_names 列表里激活
+        #   3. 然后再恢复这里的 remap=('cmd_vel','cmd_vel_safe')
         parameters=[{
             'port': stm32_port,
             'baudrate': stm32_baudrate,
@@ -411,6 +439,21 @@ def generate_launch_description():
         convert_types=True,
     )
 
+    # ──────────────────────────────────────────────────────────────────
+    # ★ v6 控制链路（关键修复"撞向障碍物"问题）：
+    #   controller_server   → /cmd_vel
+    #     collision_monitor → /cmd_vel_safe
+    #       stm32_bridge    → STM32 (订 /cmd_vel_safe，通过上方 remap)
+    #
+    # collision_monitor 在 nav2_params.yaml 中配置：
+    #   cmd_vel_in_topic:  cmd_vel
+    #   cmd_vel_out_topic: cmd_vel_safe
+    # 它根据 /scan_filtered 检测前方 1.5s 内可能碰撞的距离，
+    # 把通过的线速度按比例缩放到 0，作为 MPPI 之外的物理避障兜底。
+    #
+    # 这种方案的好处：不需要修改 nav2_bringup 的内部封装，
+    # 只通过 stm32_bridge 的 remap 把 collision_monitor 串入链路。
+    # ──────────────────────────────────────────────────────────────────
     nav2_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(nav2_bringup_dir, 'launch', 'bringup_launch.py')

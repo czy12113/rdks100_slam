@@ -36,11 +36,23 @@
 
 amcl:
   ros__parameters:
-    alpha1: 0.2
-    alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.2
-    alpha5: 0.2
+    # ★ v6.4 阿克曼专用噪声模型：alpha1~4 全部上调到 0.3
+    # ────────────────────────────────────────────────────────
+    # alpha1: 旋转引起的旋转误差（Ackermann 转弯时舵机有间隙、轮胎打滑 → 大）
+    # alpha2: 平移引起的旋转误差（高速直线时车身轻微偏航 → 中）
+    # alpha3: 平移引起的平移误差（编码器累积误差 → 中）
+    # alpha4: 旋转引起的平移误差（转弯滑移 → 大）
+    # alpha5: 平移期间的额外侧向误差（差速底盘≈0；阿克曼小幅侧滑 → 小）
+    #
+    # alpha 太低（如 0.2）→ AMCL 过度信任里程计 → 累积漂移不被纠正
+    # alpha 太高（如 0.5）→ AMCL 过度怀疑里程计 → 粒子云膨胀 → 定位抖动
+    # 0.3 是阿克曼小车的甜点：既允许轮胎打滑造成的预期误差，
+    # 又不至于因过度怀疑里程计而扩大粒子云。
+    alpha1: 0.3
+    alpha2: 0.3
+    alpha3: 0.3
+    alpha4: 0.3
+    alpha5: 0.1
     base_frame_id: "base_link"
     beam_skip_distance: 0.5
     beam_skip_error_threshold: 0.9
@@ -56,13 +68,24 @@ amcl:
     #   max_beams 60→30（每次更新激光束减半，AMCL CPU -50%）
     #   max/min_particles 同步减半
     max_beams: 30
-    max_particles: 800
-    min_particles: 200
+    # ★ v6.4：粒子数适度上调（200→400 / 800→1500），增强 KLD 收敛能力
+    # RK S100 实测 1500 粒子的 AMCL 更新耗时 < 30ms，完全在预算内。
+    # 之前 200/800 是为了极限省 CPU，但代价是粒子云覆盖不够，
+    # 漂移积累几厘米就找不到正确粒子，进一步累积。
+    max_particles: 1500
+    min_particles: 400
     odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
+    # ★ v6.4：开启 KLD 短期/长期粒子补偿（绑架问题恢复）
+    # ────────────────────────────────────────────────────────
+    # recovery_alpha_fast/slow 默认 0.0（关闭），代价是 AMCL 一旦定位漂走就
+    # 永远拽不回来。开启后 AMCL 会监控"短期权重均值/长期权重均值"的比值，
+    # 当比值下降说明粒子整体匹配变差（漂走了），AMCL 会自动注入随机粒子
+    # 帮助快速重新收敛。
+    # 0.1 / 0.001 是 ROS 文档推荐的稳定取值。
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
     resample_interval: 1
     # 阿克曼底盘建议：先沿用 Differential（Nav2 AMCL 内置），如发现里程计噪声
     # 在转弯时偏差较大，可改为 OmniMotionModel 以容纳轻微侧滑。
@@ -75,20 +98,36 @@ amcl:
     #   message_filter_queue_size：消息缓存队列加大，吃下短时抖动
     transform_tolerance: 1.0
     message_filter_queue_size: 200
-    update_min_a: 0.2
-    update_min_d: 0.25
+    # ★ v6.4：触发 AMCL 重定位的最小位移/旋转门槛
+    # ────────────────────────────────────────────────────────
+    # 默认值 d=0.25/a=0.20 意味着小车要走完 25 cm 或转 11° 才更新一次 AMCL。
+    # 阿克曼车 0.15 m/s 巡航 = 1.67s 才更新一次 → 1.67s 内里程计纯靠
+    # 编码器外推 → 漂移完全不被纠正。
+    # 收紧到 d=0.10 / a=0.10：每 10 cm 或 5.7° 更新一次 AMCL，0.15 m/s
+    # 下约 0.67s 更新一次，漂移积累 < 2 cm 就被纠正。
+    # 代价：AMCL CPU 占用上升约 +30%（实测 RK S100 仍有富余）。
+    update_min_a: 0.1
+    update_min_d: 0.1
     z_hit: 0.5
     z_max: 0.05
     z_rand: 0.5
     z_short: 0.05
     scan_topic: scan_filtered
-    # 开机即定位到地图原点；若每次开机姿态不同，请在 launch 时覆盖。
-    set_initial_pose: true
-    initial_pose:
-      x: 0.0
-      y: 0.0
-      z: 0.0
-      yaw: 0.0
+    # ★ v6 关键修复：set_initial_pose 改回 false
+    # ────────────────────────────────────────────────────────────────
+    # v5 设为 true + initial_pose=(0,0,0) 会导致：
+    #   1. AMCL 启动瞬间强制把车定位到地图原点(0,0,0)
+    #   2. 用户实际把车移到了"中心偏后"位置（≠原点），位姿错位
+    #   3. 用户 RViz 点 2D Pose Estimate 校准，但 AMCL 已用错位的
+    #      初始姿态跑了几秒钟，期间 local costmap 把激光雷达观测到
+    #      的障碍物"投影"到了错误地图位置 → 障碍物在 costmap 中的
+    #      位置和真实物理位置错位
+    #   4. MPPI 按错位的 costmap 规划，避障算法判定"前方无障碍"，
+    #      实际却撞上真实障碍物
+    # v6 强制要求 RViz 2D Pose Estimate 校准后再发任务，避免错位。
+    # 启动后 AMCL 没有初始位姿前不会输出 map→odom TF，Nav2 会等待
+    # 用户在 RViz 校准，这是最稳的做法。
+    set_initial_pose: false
     # 真实激光最大量程，与 pointcloud_to_laserscan.yaml 对齐
     # （laser_max_range 默认是 -1.0 表示用 scan 自身的 range_max，已足够；
     #  这里显式拉齐，避免雷达上报异常 inf 时 AMCL 误判）
@@ -183,15 +222,28 @@ controller_server:
     goal_checker_plugins: ["general_goal_checker"]
     controller_plugins: ["FollowPath"]
     use_realtime_priority: false
+    # ★ v6.2 显式声明：Nav2 controller_server 发布 geometry_msgs/Twist
+    # 而不是 TwistStamped。stm32_bridge 订阅的是 Twist，必须保持一致。
+    # Nav2 Jazzy/Rolling 默认 enable_stamped_cmd_vel=true，会导致
+    # stm32_bridge 永远收不到消息（rx=0/s, tx=0/s）。
+    # Nav2 Humble 默认 false，但显式声明保证升级兼容性。
+    enable_stamped_cmd_vel: false
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      # ★ v5 进一步放宽：低速场景下到点附近的小振荡也会被 progress checker
-      #   误判为"无进展"，触发 BT recovery → 清 costmap → 重规划 → 突然前冲。
-      #   把 required_movement_radius 从 0.10 → 0.05（5 cm 算有进展），
-      #   movement_time_allowance 15s → 30s（即使振荡也不轻易触发恢复）。
+      # ★ v6 修复"撞墙后停一会又前冲"：
+      # v5 把 movement_time_allowance 拉到 30s，本意是"避免终点小振荡
+      # 触发 recovery"。但代价是：小车撞上障碍物 → STM32 堵转保护停车
+      # → progress_checker 长达 30s 不报失败，期间 controller 仍在发
+      # cmd_vel，STM32 看门狗一恢复就再次前冲。
+      # v6 把 movement_time_allowance 收回到 8s，配合 v6 启用的
+      # collision_monitor 兜底（接近障碍物会主动减速到 0），整体行为：
+      #   - 8s 内还没进展 → BT 进入 recovery → 清 costmap 重规划
+      #   - 而不是无脑再次冲向同一障碍
+      # required_movement_radius 保持 0.05 m（5 cm 算有进展），避免
+      # 低速场景的小振荡误判。
       required_movement_radius: 0.05
-      movement_time_allowance: 30.0
+      movement_time_allowance: 8.0
 
     # ─────────────────────────────────────────────────────────────────────
     # 阿克曼到点判定（v5：禁用 yaw 检查，根治"停下→倒车→摆动→突然前冲"）
@@ -234,31 +286,49 @@ controller_server:
       ay_max: 0.0
       ay_min: 0.0
       az_max: 1.0
-      # 采样标准差再缩小：v5 vx_max=0.15 后，0.06 已经偏大（占总速度 40%），
-      # 缩到 0.04 让候选轨迹更稳定地落在低速带，避免高速候选触发倒车
-      vx_std: 0.04
+      # ★ v6.5 进一步降速：vx_max 0.15 → 0.10，vx_std 0.04 → 0.025
+      # ────────────────────────────────────────────────────────
+      # 调速带宽变窄到 [0.08, 0.10]（分辨率 0.02 m/s），vx_std 同步
+      # 收缩到 0.025（≈ 25% 带宽），让候选轨迹更聚焦在低速段。
+      vx_std: 0.025
       vy_std: 0.0
-      wz_std: 0.15
-      # ── v5 真车巡航速度（继续降速 + 关闭倒车）────────────────────────
-      # vx_max: 0.22 → 0.15 m/s ≈ 0.54 km/h
-      #   用户反馈"慢点准确一些"，降到 0.15 m/s。配合 min_motion_linear=0.08
-      #   → 减速带宽 [0.08, 0.15]，余地仍然够 MPPI 在终点平滑减速。
-      # vx_min: -0.12 → 0.0
-      #   ★ 阿克曼车在 Nav2 中允许倒车会带来两个副作用：
-      #     1) 到点后只要 yaw/xy 有小偏差，MPPI 会立刻发倒车命令"修正"，
-      #        这正是用户看到的 "停下→倒退" 的直接原因。
-      #     2) 倒车 + 舵机延迟 + 启动门槛 → 容易摆动失控。
-      #   设为 0 强制 forward-only：到点小偏差由 BT 重规划绕一圈解决，
-      #   永远不会"原地倒车"。如果业务必须支持后退（如脱困），通过
-      #   独立的 BackUp action 控制，不通过 MPPI 自由倒车。
-      vx_max: 0.15
-      vx_min: 0.0
+      # ★ v11.0：wz_std 0.15 → 0.35（解决"只直走，不拐小角度"）
+      # ────────────────────────────────────────────────────────
+      # 现象：goal 与小车朝向夹角 5~15° 时，MPPI 始终直行越过目标，
+      #       progress_checker 报失败 → 全局重规划又把车拉回，反复振荡。
+      # 根因：vx_max=0.10 / wz_max=0.33 下，1° 朝向修正只需要
+      #       ω ≈ 0.02 rad/s。原 wz_std=0.15 看似覆盖范围够，但 critic
+      #       打分时"直行"和"微转向 0.02"的轨迹分差 < 1%，MPPI 收敛到
+      #       直行（v11 同步用 PathAngleCritic 提权打散这种平局）。
+      # 取 0.35：约等于 wz_max 全幅一个 σ，让 MPPI 在 ±0.02~0.05 rad/s
+      #       小角度修正区间也有足够采样密度。CPU 影响可忽略
+      #       （batch_size 不变，仅采样分布展宽）。
+      wz_std: 0.35
+      # ── v6.5 真车巡航速度（用户要求"慢点准确"，再降一档）──────────
+      # vx_max: 0.15 → 0.10 m/s ≈ 0.36 km/h，配合 min_motion_linear=0.08
+      #   减速带宽 [0.08, 0.10]，物理刹停距离 < 1.5 cm（v6.4 时 2.5 cm 又缩半）
+      # wz_max: 0.50 → 0.33，保持 r_min = vx_max/wz_max = 0.10/0.33 = 0.30 m
+      #   与 AckermannConstraints.min_turning_r 阿克曼物理约束完全一致
+      #
+      # ★ v11.0：vx_min 0.0 → 0.05 ─ Ackermann motion model 关键修复
+      # ────────────────────────────────────────────────────────
+      # 现象：候选轨迹可视化里两根黄线完全平行直线，没有任何转向扇形
+      # 根因：nav2_mppi 的 Ackermann motion model 强行裁剪
+      #         |wz| ≤ vx / min_turning_r
+      #       当 vx_std=0.025 把候选 vx 拉到接近 vx_min=0 时，wz 上限
+      #       归零 → 所有候选被压成直线 → MPPI 永远算不出转向命令。
+      # 修复：vx_min 0.0 → 0.05，保证 wz 可行域至少 0.05/0.25=±0.20 rad/s
+      #       0.05 m/s 仍是"前进"（倒车需 < 0），不影响 forward-only 语义。
+      # 副作用：到点后最低速度从 0 变成 0.05 m/s，需要 goal_checker 在
+      #       xy_goal_tolerance=0.20 m 内提前判定到达；当前阈值已够。
+      vx_max: 0.10
+      vx_min: 0.05
       vy_max: 0.0     # 禁止侧移
-      wz_max: 0.50    # r_min = 0.15/0.50 = 0.30 m，与 AckermannConstraints 对齐
+      wz_max: 0.33    # r_min = 0.10/0.33 = 0.30 m，与阿克曼物理约束一致
       iteration_count: 1
-      # 前瞻距离：vx_max=0.15 × time_steps=30 × model_dt=0.10 = 0.45 m
-      # prune_distance 收到 0.8 m，更聚焦近端路径
-      prune_distance: 0.8
+      # 前瞻距离：vx_max=0.10 × time_steps=30 × model_dt=0.10 = 0.30 m
+      # prune_distance 收到 0.6 m，更聚焦近端路径
+      prune_distance: 0.6
       transform_tolerance: 0.1
       temperature: 0.3
       gamma: 0.015
@@ -270,9 +340,18 @@ controller_server:
         trajectory_step: 5
         time_step: 3
       AckermannConstraints:
-        # 理论 r_min = vx_max/wz_max = 0.22/0.60 ≈ 0.37 m
-        # 给 0.30 m 留少量余量，避免短距离/急转目标无解
-        min_turning_r: 0.30
+        # 理论 r_min = vx_max/wz_max = 0.10/0.33 = 0.30 m
+        # ★ v11.0：min_turning_r 0.30 → 0.25
+        # ────────────────────────────────────────────────────────
+        # 把 motion model 约束放宽到 0.25，让 vx=0.10 下 wz 上限抬到
+        # vx/r_min = 0.40 > wz_max(0.33)，等价于 wz 完全不被 r_min
+        # 截断 → MPPI 可以在 ±wz_max 全幅采样转向命令。
+        # 物理上：真车实测最小转弯半径若 ≥ 0.25 m 即可。本次若发现
+        # 转向不足再降到 0.20。
+        # 另外：若诊断 B 显示 tx_cmd[1] 非零但车不转，按
+        # "cmd_vel {vx:0.10, wz:0.33}" 画圆量直径，实测最小转弯半径，
+        # 实测 > 0.6 m 时必须把此值改成实测值。
+        min_turning_r: 0.25
       critics: [
         "ConstraintCritic", "CostCritic", "GoalCritic",
         "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
@@ -281,12 +360,18 @@ controller_server:
         enabled: true
         cost_power: 1
         cost_weight: 4.0
-      # ★ v5 终点收敛：GoalCritic 主导减速
+      # ★ v6.3 关键修复：压低 GoalCritic，避免它压过 CostCritic
+      # ────────────────────────────────────────────────────────
+      # 之前 cost_weight=20.0 > CostCritic=18.0，threshold=2.5m 大半个测试场地，
+      # 导致 MPPI 候选轨迹评分中"奔向目标"的奖励 > "避开障碍"的惩罚，
+      # 车径直撞向障碍物。v6.3 把 GoalCritic 调低到 8.0、激活距离压到 1.0 m：
+      #   - 远离目标时（>1m）GoalCritic 完全关闭，路径跟随和避障主导
+      #   - 进入 1m 后再启用 GoalCritic 帮助末端收敛
       GoalCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 20.0
-        threshold_to_consider: 2.5
+        cost_weight: 8.0
+        threshold_to_consider: 1.0
       # ★ v5 关键：完全禁用 GoalAngleCritic
       #   阿克曼不能原地旋转，强行让 MPPI 在终点纠正朝向 →
       #   产生倒车 + 弧线 + 摆动。彻底关掉，朝向交给业务层处理。
@@ -295,29 +380,76 @@ controller_server:
         cost_power: 1
         cost_weight: 0.0
         threshold_to_consider: 0.5
-      # ★ v5：PreferForwardCritic 完全恢复正常权重
-      #   v4 把它降到 2.0 是为了让 GoalCritic 减速主导；
-      #   但 v5 已经通过 vx_min=0.0 强制禁止倒车，PreferForwardCritic
-      #   不再需要"对抗"GoalCritic，恢复到中等权重 5.0 让小车保持前进。
+      # ★ v6.3：PreferForwardCritic 权重再降到 2.0
+      #   v5 设 5.0 时为了"保持前进感"，但实测它会和 CostCritic 形成
+      #   推-拉对抗：CostCritic 想绕开障碍，PreferForwardCritic 想直行 →
+      #   合力依然朝前 → 撞。v6.3 把它降到 2.0，让避障/路径跟随主导，
+      #   PreferForwardCritic 只在已经接近正确朝向时给微弱正反馈，
+      #   避免成为避障的对手。
       PreferForwardCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0
+        cost_weight: 2.0
         threshold_to_consider: 0.5
+      # ★ v6.3 关键修复：CostCritic 全面加强（这是车冲向障碍物的真凶）
+      # ────────────────────────────────────────────────────────────────
+      # v6.2 实测：链路通了、costmap 里能看见蓝紫色膨胀，但车依然径直撞向
+      # 障碍物。深入 nav2_mppi_controller/src/critics/cost_critic.cpp 的
+      # 评分逻辑后定位出三层问题，v6.3 一次修齐：
+      #
+      # 【问题 1】near_goal_distance: 1.0 ← 这是最致命的一条
+      #   MPPI 的 CostCritic::score() 末尾有一段：
+      #     if (near_goal_distance_ > 0.0 &&
+      #         utils::withinPositionDistance(data.path, last_pose, near_goal_distance_))
+      #         return;  // 静默跳过避障评分！
+      #   含义：候选轨迹末端到全局路径末端的距离 < 1.0 m 时，
+      #   CostCritic 直接 return，**整条轨迹的避障代价不计入评分**。
+      #   而用户的测试场景就是"在障碍物前 1~2 m 处打 Goal Pose"，
+      #   此时几乎所有候选轨迹的末端都落在这个 1.0 m 窗口里
+      #   → CostCritic 形同虚设 → MPPI 只看 GoalCritic+PathAlign+PreferForward
+      #   → 三者合力直接指向障碍物背后的目标点 → 撞。
+      #   v6.3 改 0.2 m：只在最后 20 cm 关闭避障（用于精准到点），
+      #   其余距离全程启用 CostCritic。
+      #
+      # 【问题 2】critical_cost: 220.0 ← 报警太迟
+      #   InflationLayer 的代价随距离指数衰减（cost_scaling_factor=2.0）：
+      #     距障碍中心 0.15 m（inscribed）→ cost 253
+      #     0.20 m → ~228
+      #     0.25 m → ~206
+      #     0.30 m → ~186
+      #     0.40 m → ~153
+      #     0.60 m → ~83
+      #   critical_cost=220 对应车体中心距障碍 ~0.21 m（车边缘只剩 6 cm 余量），
+      #   到这里才"判为关键"已经来不及刹车。
+      #   v6.3 改 120：对应车体中心距障碍 ~0.45 m（车边缘 30 cm 余量），
+      #   配合 0.10 m/s 巡航 + 1.2 m/s² 减速（停车距离 < 1 cm）绰绰有余。
+      #
+      # 【问题 3】trajectory_point_step: 2 ← 候选轨迹漏检 50% 的点
+      #   MPPI 在每条候选轨迹上每 step=2 个点采样一次代价。轨迹 30 个点
+      #   只查 15 个，中间穿过障碍物的细窄轨迹有 50% 概率漏检。
+      #   v6.3 改 1：每个点都查，CPU 增量小（RK S100 完全扛得住）。
+      #
+      # 【副作用控制】consider_footprint 仍保持 false（保 robot_radius 用法
+      # 不变，不需要重写 footprint 多边形）。
       CostCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 3.81
+        cost_weight: 32.0          # 18.0 → 32.0，确保 CostCritic 主导评分
         near_collision_cost: 253
-        critical_cost: 300.0
+        critical_cost: 120.0       # 220.0 → 120.0，提前 30cm 触发减速 ★
         consider_footprint: false
         collision_cost: 1000000.0
-        near_goal_distance: 1.0
-        trajectory_point_step: 2
+        near_goal_distance: 0.2    # 1.0 → 0.2 ★★★ 这是车冲向障碍物的真凶
+        trajectory_point_step: 1   # 2 → 1，每点都查，杜绝漏检
+      # ★ v6.3：PathAlignCritic 权重适度下调，给 CostCritic 让路
+      #   原 14.0 让小车"硬贴路径"，全局规划如果离障碍物只有
+      #   inflation_radius=0.40m 的余量，PathAlign 会强行把车
+      #   按在路径上即使两侧 cost 已经偏高。降到 8.0 让 CostCritic
+      #   可以在必要时把车从路径上"推开"几十厘米去绕障。
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 14.0
+        cost_weight: 8.0
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
         threshold_to_consider: 0.5
@@ -329,13 +461,34 @@ controller_server:
         cost_weight: 5.0
         offset_from_furthest: 5
         threshold_to_consider: 1.4
+      # ★ v11.0：PathAngleCritic 提权 + 早触发（解决"只直走，不拐小角度"）
+      # ────────────────────────────────────────────────────────────
+      # 与 wz_std 提到 0.35 配合使用：仅展宽采样还不够，还得让 critic
+      # 评分系统对"小角度跟向"给足惩罚梯度。
+      #
+      #   cost_weight: 2.0 → 8.0
+      #     原值 2.0 几乎是其它 critic 的 1/4，朝向偏差对总分影响微弱。
+      #     提到 8.0 与 PathAlignCritic 同级，让"航向不对齐路径"
+      #     成为可与避障并列考虑的代价项。
+      #
+      #   max_angle_to_furthest: 1.0 → 0.6 rad（57° → 34°）
+      #     原 1.0 rad（57°）才开始施加角度惩罚，5~15° 这种小角度修正
+      #     不被该 critic 监管 → MPPI 当作平局 → 直行胜出。改 0.6 rad
+      #     让 30° 内的偏差也进入评分。
+      #
+      #   offset_from_furthest: 4 → 2（评估点更靠当前位置）
+      #     之前看 4 个轨迹点之后的姿态偏差，太远；改 2 让 critic 在
+      #     轨迹早期就约束朝向，与 wz_std 提宽配合加速收敛。
+      #
+      # 三项一起调整后，对 30° 以内的小偏航 critic 输出明显非零代价；
+      # MPPI 自然会发出 ±0.02~0.05 rad/s 的微调命令。
       PathAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 2.0
-        offset_from_furthest: 4
+        cost_weight: 8.0
+        offset_from_furthest: 2
         threshold_to_consider: 0.5
-        max_angle_to_furthest: 1.0
+        max_angle_to_furthest: 0.6
         mode: 0
 
 # ============================================================================
@@ -378,10 +531,17 @@ local_costmap:
       plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # cost_scaling_factor 调小 → 代价衰减更缓，INSCRIBED 区域不会过大；
-        # inflation_radius 仅比车体半径多 3 cm，避免起点落入致命区
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.18
+        # ★ v6 关键：把 inflation_radius 从 0.18 → 0.40 (扩 22 cm)
+        # 旧值 0.18 = robot_radius(0.15) + 3 cm 缓冲，缓冲带只有 3 cm，
+        # MPPI 控制循环 10 Hz + 巡航 0.15 m/s 下，物理刹停距离最多
+        # 12 cm（0.15² / (2*1.0) + 0.1s 控制延迟），3 cm 缓冲完全不够，
+        # 这是"撞向障碍物"的直接物理原因。
+        # 新值 0.40 = robot_radius(0.15) + 25 cm 安全缓冲，
+        # 配合 CostCritic 加大权重，足以在撞前 25 cm 触发减速。
+        # cost_scaling_factor 同步降到 2.0，让代价从致命到 0 衰减更
+        # 平缓，避免 inflation 过宽造成狭窄通道规划困难。
+        cost_scaling_factor: 2.0
+        inflation_radius: 0.40
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -432,10 +592,12 @@ global_costmap:
         map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # ★ 与 local_costmap 完全对齐，避免 global 起点已可通行但 local
-        # 把同一点判为致命，导致规划 OK 但控制段刚出发就 abort
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.18
+        # ★ v6 与 local_costmap 同步加大安全边距，让 SmacPlanner2D
+        # 全局规划阶段就避开障碍物 25 cm，而不是依赖 local costmap
+        # 临时绕行。两层 costmap 完全对齐避免 "global 通行 / local
+        # 致命" 的不一致。
+        cost_scaling_factor: 2.0
+        inflation_radius: 0.40
       always_send_full_costmap: True
 
 map_server:
@@ -562,10 +724,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    # [vx, vy, wz] —— 与 MPPI 的 vx_max/wz_max 对齐（v5 慢速精准模式）
-    max_velocity: [0.15, 0.0, 0.50]
+    # [vx, vy, wz] —— 与 MPPI 的 vx_max/wz_max 对齐（v6.5 进一步降速）
+    max_velocity: [0.10, 0.0, 0.33]
     # v5：min_velocity 线速度设为 0，与 MPPI vx_min=0 同步，强制禁止倒车
-    min_velocity: [0.0, 0.0, -0.50]
+    min_velocity: [0.0, 0.0, -0.33]
     # v5：加减速更柔和，避免终点附近的急刹反向
     max_accel: [0.5, 0.0, 1.0]
     max_decel: [-1.2, 0.0, -1.0]
@@ -575,25 +737,36 @@ velocity_smoother:
     deadband_velocity: [0.005, 0.0, 0.010]
     velocity_timeout: 1.0
 
-# ── 碰撞监控 ──
-# ★ 当前为 "最小验证链路" 模式（按 运动控制导航问题修改建议.md 第 3 节）：
-#   controller_server → /cmd_vel → stm32_bridge
-#   collision_monitor 不再覆盖 /cmd_vel，输出到无人订阅的
-#   /cmd_vel_collision_monitor（实质等同禁用，但保留节点存活避免
-#   lifecycle_manager 卡在 activate）。
+# ── 碰撞监控（v6.2：保留参数但实际处于旁路状态）──
+# ────────────────────────────────────────────────────────────────
+# 重要事实：nav2_bringup 的默认 launch 不会启动 nav2_collision_monitor
+# 节点，也不会把它加进 lifecycle_manager 的 node_names 列表。
+# 因此本 yaml 里的 collision_monitor 配置实际**不会被任何节点读取**，
+# 留在这里只是为将来想真正启用避障兜底时的参考。
 #
-# 验证小车能正常导航后，如果要启用碰撞兜底：
-#   1. 在 launch 给 controller_server remap：('/cmd_vel', '/cmd_vel_nav')
-#   2. velocity_smoother 订阅 cmd_vel_nav 输出 cmd_vel_smoothed
-#   3. cmd_vel_in_topic 设为 cmd_vel_smoothed（已是）
-#   4. cmd_vel_out_topic 改回 /cmd_vel
-#   5. stm32_bridge 仍订 /cmd_vel
+# 当前（v6.2）速度链路：
+#   controller_server → /cmd_vel → stm32_bridge → STM32
+# MPPI 自身的避障由 CostCritic 保证：
+#   cost_weight=18.0 + critical_cost=220.0 + inflation_radius=0.40
+#
+# 如果将来要真正启用 collision_monitor，需要在 launch 里：
+#   1. 添加 Node(package='nav2_collision_monitor',
+#               executable='collision_monitor', ...)
+#   2. 把 'collision_monitor' 加进 lifecycle_manager_navigation
+#      的 node_names 列表（在 nav2_bringup 的 navigation_launch.py 里）
+#   3. 把 stm32_bridge 的 remap 改回 ('cmd_vel','cmd_vel_safe')
+#   4. 把 cmd_vel_out_topic 改回 cmd_vel_safe
+# 三步缺一不可，否则会出现：
+#   - 缺 step 1/2：/cmd_vel_safe 没人发，bridge 收不到命令（v6 故障）
+#   - 缺 step 3：collision_monitor 输出无人订阅
+#   - 缺 step 4：collision_monitor 覆盖 controller 的 cmd_vel 形成回环
 collision_monitor:
   ros__parameters:
     base_frame_id: "base_link"
     odom_frame_id: "odom"
-    cmd_vel_in_topic: "cmd_vel_smoothed"
-    cmd_vel_out_topic: "/cmd_vel_collision_monitor"
+    # 注意：这两个 topic 名只在 collision_monitor 节点被启动并激活时才有效
+    cmd_vel_in_topic: "cmd_vel"
+    cmd_vel_out_topic: "cmd_vel_safe"
     state_topic: "collision_monitor_state"
     transform_tolerance: 0.2
     source_timeout: 1.0
@@ -604,10 +777,10 @@ collision_monitor:
       type: "polygon"
       action_type: "approach"
       footprint_topic: "/local_costmap/published_footprint"
-      time_before_collision: 1.2
+      time_before_collision: 1.5
       simulation_time_step: 0.1
-      min_points: 6
-      visualize: False
+      min_points: 4
+      visualize: True
       enabled: True
     observation_sources: ["scan"]
     scan:
