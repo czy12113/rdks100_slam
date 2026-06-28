@@ -37,14 +37,21 @@ WS_MESSAGE_QUEUE_SIZE: int = 100       # 消息队列大小
 
 # -----------------------------------------------------------------------------
 # 数据推送频率配置（Hz -> 秒间隔）
+#
+# ⚠️ 重型 topic（lidar/video/imu）的频率直接影响 WebSocket 带宽和前端解析负担。
+#    点云已从 10Hz/10000 点 → 5Hz/5000 点；视频从 30fps → 15fps。
+#    如果设备性能富余且前端不卡，可逐步调高。
 # -----------------------------------------------------------------------------
 PUSH_RATE_SYSTEM_INFO: float = 1.0     # 系统信息推送间隔（秒）
 PUSH_RATE_ROBOT_STATUS: float = 0.1    # 机器人状态推送间隔（秒，10Hz）
-PUSH_RATE_LIDAR: float = 0.1           # 激光雷达数据推送间隔（秒，10Hz）
+PUSH_RATE_LIDAR: float = 0.2           # 激光雷达数据推送间隔（秒，5Hz）
 PUSH_RATE_IMU: float = 0.05            # IMU 数据推送间隔（秒，20Hz）
 PUSH_RATE_SLAM_MAP: float = 0.5        # SLAM 地图推送间隔（秒，2Hz）
-PUSH_RATE_VIDEO: float = 0.033         # 视频帧推送间隔（秒，~30fps）
+PUSH_RATE_VIDEO: float = 0.066         # 视频帧推送间隔（秒，~15fps）
 PUSH_RATE_LOG: float = 0.5             # 日志推送间隔（秒）
+
+# 点云降采样上限：每帧最多发送给前端的点数（19968 点 → 5000 点约 25%）
+LIDAR_MAX_PUSH_POINTS: int = 5000
 
 # -----------------------------------------------------------------------------
 # ROS2 配置
@@ -74,6 +81,13 @@ ROS2_TOPIC_SLAM_POSE: str = "/slam/pose"                    # SLAM 位姿
 ROS2_TOPIC_PATH: str = "/plan"                              # 规划路径
 ROS2_TOPIC_GOAL: str = "/goal_pose"                         # 导航目标点
 ROS2_TOPIC_DIAGNOSTICS: str = "/diagnostics"                # 诊断信息
+
+# ── VLM 场景理解（vlm_scene 节点）─────────────────────────────────────────────
+# vlm_node 接收检测框 + 关键帧，调用通义千问 VL（或其它 provider）输出自然语言。
+# backend 仅订阅这两个 topic 做转发，不会自己再发起 VLM 请求，避免 RDK 算力浪费。
+ROS2_TOPIC_VLM_DESCRIPTION: str = "/vlm/scene_description"
+ROS2_TOPIC_VLM_STATUS: str = "/vlm/status"
+ROS2_SERVICE_VLM_ASK: str = "/vlm/ask"
 
 # ROS2 Service 名称
 ROS2_SERVICE_SAVE_MAP: str = "/slam/save_map"               # 保存地图

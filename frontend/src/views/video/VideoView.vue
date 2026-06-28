@@ -150,7 +150,83 @@
       </el-col>
     </el-row>
 
-    <!-- 第三行：相机参数 -->
+    <!-- 第三行：VLM 场景理解（AI 自然语言描述） -->
+    <el-row :gutter="12" class="mt12">
+      <el-col :span="24">
+        <div class="tech-card vlm-card">
+          <div class="card-header">
+            <span class="card-title">
+              <el-icon><MagicStick /></el-icon> 场景理解
+              <span class="vlm-provider" v-if="vlmProvider">
+                {{ vlmProvider }} / {{ vlmModel }}
+              </span>
+            </span>
+            <div class="actions">
+              <el-tag size="small" :type="vlmReady ? 'success' : 'info'">
+                {{ vlmReady ? '在线' : '未启动' }}
+              </el-tag>
+              <el-tag size="small" type="warning" v-if="vlmLastMs > 0">
+                {{ vlmLastMs }} ms
+              </el-tag>
+              <el-button
+                size="small"
+                type="primary"
+                :loading="vlmAsking"
+                @click="askVlm()"
+              >
+                <el-icon><Refresh /></el-icon> 立即分析
+              </el-button>
+            </div>
+          </div>
+
+          <!-- 最新描述 -->
+          <div class="vlm-latest">
+            <div v-if="vlmLatest" class="vlm-text">{{ vlmLatest }}</div>
+            <div v-else class="vlm-empty">
+              <el-icon size="24"><MagicStick /></el-icon>
+              <p>等待 VLM 节点输出场景描述...</p>
+              <p class="hint">ros2 launch vlm_scene vlm.launch.py</p>
+            </div>
+            <div class="vlm-meta" v-if="vlmLatestTs">
+              <span>{{ formatTs(vlmLatestTs) }}</span>
+              <span v-if="vlmDetCount >= 0">· {{ vlmDetCount }} 个目标</span>
+            </div>
+          </div>
+
+          <!-- 手动 prompt -->
+          <div class="vlm-prompt-bar">
+            <el-input
+              v-model="vlmPrompt"
+              placeholder="可选：自定义提问（留空走默认场景描述）"
+              size="small"
+              clearable
+              @keyup.enter="askVlm(vlmPrompt)"
+            />
+            <el-button size="small" @click="askVlm(vlmPrompt)" :loading="vlmAsking">
+              提问
+            </el-button>
+          </div>
+
+          <!-- 历史折叠 -->
+          <el-collapse v-model="vlmHistoryOpen" class="vlm-history">
+            <el-collapse-item title="历史描述" name="history">
+              <div v-if="vlmHistory.length === 0" class="vlm-history-empty">暂无历史</div>
+              <div
+                v-else
+                v-for="(item, idx) in vlmHistory"
+                :key="idx"
+                class="vlm-history-item"
+              >
+                <span class="hist-ts">{{ formatTs(item.timestamp) }}</span>
+                <span class="hist-text">{{ item.description }}</span>
+              </div>
+            </el-collapse-item>
+          </el-collapse>
+        </div>
+      </el-col>
+    </el-row>
+
+    <!-- 第四行：相机参数 -->
     <el-row :gutter="12" class="mt12">
       <el-col :span="24">
         <div class="tech-card">
@@ -174,6 +250,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { wsClient } from '@/api/websocket'
+import { vlmApi } from '@/api/http'
 import { ElMessage } from 'element-plus'
 
 // ── 图像流状态 ────────────────────────────────────────────────────────────────
@@ -266,6 +343,111 @@ const unsubResults = wsClient.on('detection_results', (data: any) => {
   lastDetCount.value = data.count        ?? 0
 })
 
+// ── VLM 场景理解 ──────────────────────────────────────────────────────────────
+interface VlmRecord {
+  description: string
+  timestamp:   number
+  provider?:   string
+  model?:      string
+  det_count?:  number
+  elapsed_ms?: number
+}
+
+const vlmLatest      = ref<string>('')
+const vlmLatestTs    = ref<number>(0)
+const vlmProvider    = ref<string>('')
+const vlmModel       = ref<string>('')
+const vlmLastMs      = ref<number>(0)
+const vlmDetCount    = ref<number>(-1)
+const vlmReady       = ref<boolean>(false)
+const vlmHistory     = ref<VlmRecord[]>([])
+const vlmHistoryOpen = ref<string[]>([])
+const vlmPrompt      = ref<string>('')
+const vlmAsking      = ref<boolean>(false)
+
+// WebSocket: 实时场景描述
+const unsubVlmDesc = wsClient.on('vlm_description', (data: any) => {
+  if (!data?.description) return
+  vlmLatest.value   = data.description
+  vlmLatestTs.value = data.timestamp ?? (Date.now() / 1000)
+  vlmProvider.value = data.provider ?? vlmProvider.value
+  vlmModel.value    = data.model    ?? vlmModel.value
+  vlmLastMs.value   = Math.round(data.elapsed_ms ?? 0)
+  vlmDetCount.value = data.det_count ?? -1
+  vlmReady.value    = true
+  // 推入历史前面，限制 50 条
+  vlmHistory.value.unshift({
+    description: data.description,
+    timestamp:   vlmLatestTs.value,
+    provider:    data.provider,
+    model:       data.model,
+    det_count:   data.det_count,
+    elapsed_ms:  data.elapsed_ms,
+  })
+  if (vlmHistory.value.length > 50) vlmHistory.value.length = 50
+})
+
+// WebSocket: 节点状态/心跳
+const unsubVlmStatus = wsClient.on('vlm_status', (data: any) => {
+  if (!data) return
+  vlmReady.value    = !!data.ready
+  vlmProvider.value = data.provider ?? vlmProvider.value
+  vlmModel.value    = data.model    ?? vlmModel.value
+})
+
+// 手动触发推理
+async function askVlm(prompt: string = '') {
+  if (vlmAsking.value) return
+  vlmAsking.value = true
+  try {
+    const res: any = await vlmApi.ask(prompt || '', 15)
+    if (res?.description) {
+      vlmLatest.value   = res.description
+      vlmLatestTs.value = res.timestamp ?? (Date.now() / 1000)
+      vlmLastMs.value   = Math.round(res.elapsed_ms ?? 0)
+      ElMessage.success('VLM 推理完成')
+    } else if (res?.error) {
+      ElMessage.error(`VLM 失败: ${res.error}`)
+    }
+  } catch (e: any) {
+    ElMessage.error(`VLM 请求失败: ${e.message || e}`)
+  } finally {
+    vlmAsking.value = false
+  }
+}
+
+// 时间戳格式化
+function formatTs(ts: number): string {
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  const ss = String(d.getSeconds()).padStart(2, '0')
+  return `${hh}:${mm}:${ss}`
+}
+
+// 启动时拉一次历史（防止刷新页面后空白）
+async function loadVlmHistory() {
+  try {
+    const res: any = await vlmApi.getHistory(20)
+    if (Array.isArray(res?.items)) {
+      vlmHistory.value = res.items
+      if (res.items.length > 0) {
+        vlmLatest.value   = res.items[0].description
+        vlmLatestTs.value = res.items[0].timestamp
+      }
+    }
+    const st: any = await vlmApi.getStatus()
+    if (st) {
+      vlmProvider.value = st.provider ?? ''
+      vlmModel.value    = st.model    ?? ''
+      vlmReady.value    = !!st.ready
+    }
+  } catch (_e) {
+    // 后端可能未启动 VLM 路由，静默
+  }
+}
+
 // ── FPS 计算 ─────────────────────────────────────────────────────────────────
 const cameraParams = computed(() => [
   { label: 'RGB 分辨率', value: `${rgbWidth.value}×${rgbHeight.value}` },
@@ -307,6 +489,7 @@ onMounted(() => {
     depthFrameCount = 0
     annoFrameCount  = 0
   }, 1000)
+  loadVlmHistory()
 })
 
 onUnmounted(() => {
@@ -314,6 +497,8 @@ onUnmounted(() => {
   unsubDepth()
   unsubAnno()
   unsubResults()
+  unsubVlmDesc()
+  unsubVlmStatus()
   clearInterval(fpsTimer)
 })
 </script>
@@ -436,6 +621,68 @@ onUnmounted(() => {
   .legend-bar {
     flex: 1; height: 6px; border-radius: 3px;
     background: linear-gradient(90deg, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff);
+  }
+}
+
+// ── VLM 场景理解 ──────────────────────────────────────────────────────────────
+.vlm-card {
+  .vlm-provider {
+    font-size: 10px; font-family: var(--font-mono);
+    color: var(--color-text-muted); margin-left: 8px; font-weight: normal;
+  }
+  .actions { display: flex; align-items: center; gap: 6px; }
+}
+
+.vlm-latest {
+  min-height: 64px;
+  background: rgba(167, 139, 250, 0.06);
+  border: 1px solid rgba(167, 139, 250, 0.25);
+  border-radius: 6px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 6px;
+
+  .vlm-text {
+    font-size: 14px; line-height: 1.6; color: var(--color-text);
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .vlm-empty {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 6px; padding: 12px 0; color: var(--color-text-muted);
+    p { font-size: 12px; margin: 0; }
+    .hint { font-size: 10px; font-family: var(--font-mono); color: #a78bfa; opacity: 0.7; }
+  }
+  .vlm-meta {
+    display: flex; gap: 10px;
+    font-size: 10px; font-family: var(--font-mono); color: var(--color-text-muted);
+  }
+}
+
+.vlm-prompt-bar {
+  margin-top: 8px;
+  display: flex; gap: 8px;
+}
+
+.vlm-history {
+  margin-top: 4px;
+  :deep(.el-collapse-item__header) {
+    font-size: 12px; color: var(--color-text-muted);
+    background: transparent; border-bottom: 1px dashed rgba(30,58,95,0.4);
+  }
+  :deep(.el-collapse-item__wrap) { background: transparent; border: 0; }
+  :deep(.el-collapse-item__content) { padding-bottom: 6px; }
+
+  .vlm-history-empty {
+    font-size: 11px; color: var(--color-text-muted); padding: 6px 0;
+  }
+  .vlm-history-item {
+    display: flex; gap: 10px; padding: 5px 0;
+    border-bottom: 1px dashed rgba(30,58,95,0.25);
+    font-size: 12px; line-height: 1.5;
+    &:last-child { border-bottom: 0; }
+    .hist-ts {
+      font-family: var(--font-mono); color: var(--color-text-muted);
+      flex-shrink: 0; min-width: 56px;
+    }
+    .hist-text { color: var(--color-text); word-break: break-word; }
   }
 }
 

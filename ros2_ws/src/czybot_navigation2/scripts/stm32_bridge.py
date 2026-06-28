@@ -55,7 +55,7 @@ STM32 串口通信桥接节点  v5 —— 与 STM32 ChassisParams.h 全面对齐
   cmd_timeout       : 无 cmd_vel 多久自动发停车帧 (s)，默认 0.3
                        与 STM32 CMD_TIMEOUT_MS=300 完全对齐
   watchdog_timeout  : 看门狗兜底超时 (s)，默认 0.5
-  estop_repeats     : 急停时连发零速次数，默认 5
+  estop_repeats     : 急停/归零时连发零速次数，默认 15
   estop_lock_seconds: 急停锁定时长 (s)，期间忽略非零 cmd_vel，默认 0.4
   write_hz          : 串口写线程频率 (Hz)，默认 25
 """
@@ -70,6 +70,7 @@ import serial
 from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from rclpy.time import Time as RclpyTime
 from std_msgs.msg import Bool, Empty, Int32MultiArray
 from tf2_ros import TransformBroadcaster
 
@@ -108,9 +109,24 @@ class STM32Bridge(Node):
 
         self.declare_parameter('cmd_timeout', 0.3)
         self.declare_parameter('watchdog_timeout', 0.5)
-        self.declare_parameter('estop_repeats', 5)
+        self.declare_parameter('estop_repeats', 15)
         self.declare_parameter('estop_lock_seconds', 0.4)
         self.declare_parameter('write_hz', 25.0)
+
+        # ── v6.5 修复 AMCL 漂移：odom 时间戳要尽量贴近"测量时刻" ─────────
+        # 旧实现把 self.get_clock().now() 当 odom 时间戳，
+        # 但这个"现在"已经包含：串口读 + buffer 解析 + rclpy 调用 + TF 广播
+        # 路径上 5~30 ms 不可预测的处理延迟。在 0.15 m/s 巡航下，30ms 误差
+        # 等价于 4.5mm 位置错位；转弯 0.5 rad/s 时是 0.86° 偏航误差，
+        # 反映到 5m 远处墙体就是 7.5cm 偏差，AMCL 直接判定"环境不一致"
+        # 把 map→odom TF 拽走 → 看上去就是图相对车体在飘。
+        #
+        # 修复：read() 返回那一刻就打时间戳 t_arrival，再减去固定的串口
+        # 传输延迟（odom_stamp_offset_ms 负值），作为 Odometry / TF 的 stamp。
+        # 默认 -2.0 ms = 20 字节 @115200bps（≈1.74ms）+ 一点点 OS 调度抖动。
+        # 如果你的 STM32 是以固定周期 N ms 累积上行，可在 launch 里把它
+        # 设为 -N/2，使时间戳落到测量窗口中点。
+        self.declare_parameter('odom_stamp_offset_ms', -2.0)
 
         port = self.get_parameter('port').value
         baudrate = self.get_parameter('baudrate').value
@@ -128,6 +144,9 @@ class STM32Bridge(Node):
         self.ESTOP_REPEATS = int(self.get_parameter('estop_repeats').value)
         self.ESTOP_LOCK_SECONDS = float(self.get_parameter('estop_lock_seconds').value)
         self.WRITE_HZ = float(self.get_parameter('write_hz').value)
+        self.odom_stamp_offset_ns = int(
+            float(self.get_parameter('odom_stamp_offset_ms').value) * 1_000_000
+        )
 
         # 整数化的硬限幅（mm/s, mrad/s），用于 cmd_vel 入口快速比较
         self._max_linear_mm = int(self.max_linear * 1000)
@@ -214,8 +233,10 @@ class STM32Bridge(Node):
                 0.05, self.publish_initial_tf_callback)
             self.received_odom_data = False
 
-        # 接收缓冲区
+        # 接收缓冲区 + 串口读到达时间戳（用于给 odom 打更准的 stamp）
         self.rx_buffer = bytearray()
+        # 最近一次 serial.read() 返回的 ROS 时刻，原子写入即可（GIL 保证 64bit 整数原子性）
+        self._last_serial_arrival_ns = 0
 
         # ── 启动后台线程 ────────────────────────────────────────────────────
         self.running = True
@@ -400,8 +421,11 @@ class STM32Bridge(Node):
                 sent_linear = latest_v
                 sent_angular = latest_w
             elif sent_linear != 0 or sent_angular != 0:
-                # 目标刚归零：补一帧零速
-                self._raw_write(0, 0)
+                # 目标刚归零：和急停一样补发多帧零速。
+                # 一些电机驱动板会锁存上一速度；单帧 stop 丢失时会继续跑。
+                for _ in range(self.ESTOP_REPEATS):
+                    self._raw_write(0, 0)
+                    time.sleep(0.02)
                 sent_linear = 0
                 sent_angular = 0
             # else: 持续零速，不重复刷串口
@@ -538,6 +562,13 @@ class STM32Bridge(Node):
             try:
                 data = self.serial.read(self.serial.in_waiting or 1)
                 if data:
+                    # ★ v6.5 关键：read() 一返回就立即记录到达时间。
+                    # 后续 buffer 解析 / TF 广播无论花多久，odom 的 stamp
+                    # 都锚定在这一刻，AMCL 才能把"激光观测时刻"和"odom 时刻"
+                    # 对齐到同一物理瞬间。
+                    self._last_serial_arrival_ns = (
+                        self.get_clock().now().nanoseconds
+                    )
                     self.rx_buffer.extend(data)
                     self._process_rx_buffer()
             except Exception as e:
@@ -588,19 +619,41 @@ class STM32Bridge(Node):
         linear_vel = struct.unpack('<h', frame[13:15])[0]
         angular_vel = struct.unpack('<h', frame[15:17])[0]
 
+        # ★ v6.5 诊断：每 ~1s 打印一次 STM32 原始整数，
+        # 用来定位"/odom 一直是 0" 这类下位机故障。
+        # 不依赖 logger 级别，直接 print 一行容易被现场看到。
+        try:
+            self._diag_counter += 1
+        except AttributeError:
+            self._diag_counter = 1
+        if self._diag_counter % 10 == 0:  # STM32 10Hz → 每秒一行
+            self.get_logger().info(
+                f'[RX-RAW] pos_x={pos_x}mm pos_y={pos_y}mm '
+                f'yaw={yaw}mrad v={linear_vel}mm/s w={angular_vel}mrad/s'
+            )
+
         x = pos_x / 1000.0
         y = pos_y / 1000.0
         theta = yaw / 1000.0
         vx = linear_vel / 1000.0
         vth = angular_vel / 1000.0
 
-        current_time = self.get_clock().now()
+        # ★ v6.5：以 read() 到达时刻作为测量时刻基准，再减去固定传输延迟。
+        # 仅当接收线程已经成功读过至少一次串口才用 arrival 时间戳；
+        # 解析中途异常退化时回落到 now()，保证 TF 链不断。
+        arrival_ns = self._last_serial_arrival_ns
+        if arrival_ns > 0:
+            stamp_ns = max(0, arrival_ns + self.odom_stamp_offset_ns)
+            stamp = RclpyTime(nanoseconds=stamp_ns).to_msg()
+        else:
+            stamp = self.get_clock().now().to_msg()
+
         cy = math.cos(theta / 2.0)
         sy = math.sin(theta / 2.0)
 
         if self.publish_tf:
             t = TransformStamped()
-            t.header.stamp = current_time.to_msg()
+            t.header.stamp = stamp
             t.header.frame_id = 'odom'
             t.child_frame_id = 'base_link'
             t.transform.translation.x = x
@@ -613,7 +666,7 @@ class STM32Bridge(Node):
             self.tf_broadcaster.sendTransform(t)
 
         odom = Odometry()
-        odom.header.stamp = current_time.to_msg()
+        odom.header.stamp = stamp
         odom.header.frame_id = 'odom'
         odom.child_frame_id = 'base_link'
         odom.pose.pose.position.x = x
@@ -626,6 +679,24 @@ class STM32Bridge(Node):
         odom.twist.twist.linear.x = vx
         odom.twist.twist.linear.y = 0.0
         odom.twist.twist.angular.z = vth
+
+        # ★ v6.5：补全 pose / twist 协方差。AMCL 内部不直接读这个值，
+        # 但下游 robot_localization / EKF / RViz 显示都依赖；之前留空
+        # 等价于"绝对确定"，下游融合会过度信任里程计，加剧漂移表象。
+        # x, y, yaw 给 1cm / 1cm / 1°^2 量级噪声；vx, vth 同理。
+        # 不影响 AMCL 的 alpha 噪声模型（那个还是看 amcl.alpha1..5）。
+        odom.pose.covariance[0] = 1e-3       # x
+        odom.pose.covariance[7] = 1e-3       # y
+        odom.pose.covariance[14] = 1e6       # z (不可用)
+        odom.pose.covariance[21] = 1e6       # roll (不可用)
+        odom.pose.covariance[28] = 1e6       # pitch (不可用)
+        odom.pose.covariance[35] = 3e-4      # yaw (~1°)
+        odom.twist.covariance[0] = 1e-3      # vx
+        odom.twist.covariance[7] = 1e6       # vy (阿克曼禁止)
+        odom.twist.covariance[14] = 1e6
+        odom.twist.covariance[21] = 1e6
+        odom.twist.covariance[28] = 1e6
+        odom.twist.covariance[35] = 3e-4     # vth
 
         self.odom_pub.publish(odom)
         self.get_logger().debug(

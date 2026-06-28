@@ -139,7 +139,7 @@
                 <div
                   class="gauge-bar"
                   :class="velBarClass(displayVx)"
-                  :style="{ width: Math.abs(displayVx) / ROBOT_MAX_LINEAR_VEL * 100 + '%', marginLeft: displayVx < 0 ? 'auto' : '0' }"
+                  :style="{ width: velBarWidth(displayVx, ROBOT_MAX_LINEAR_VEL), marginLeft: displayVx < 0 ? 'auto' : '0' }"
                 ></div>
               </div>
               <div class="gauge-val mono">{{ displayVx.toFixed(3) }} <span class="unit">m/s</span></div>
@@ -150,7 +150,7 @@
                 <div
                   class="gauge-bar angular"
                   :class="velBarClass(displayWz)"
-                  :style="{ width: Math.abs(displayWz) / ROBOT_MAX_ANGULAR_VEL * 100 + '%', marginLeft: displayWz < 0 ? 'auto' : '0' }"
+                  :style="{ width: velBarWidth(displayWz, ROBOT_MAX_ANGULAR_VEL), marginLeft: displayWz < 0 ? 'auto' : '0' }"
                 ></div>
               </div>
               <div class="gauge-val mono">{{ displayWz.toFixed(3) }} <span class="unit">rad/s</span></div>
@@ -242,6 +242,8 @@ const angularSpeed = ref(ROBOT_DEFAULT_ANGULAR_VEL)
 // 本地显示用速度（WebSocket 有实际里程计数据时会覆盖）
 const cmdVx = ref(0)
 const cmdWz = ref(0)
+const displayCmdUntil = ref(0)
+let displayCmdTimer: ReturnType<typeof setTimeout> | null = null
 
 const odomOffsetX   = ref(0)
 const odomOffsetY   = ref(0)
@@ -256,8 +258,56 @@ const keys = ref({ w: false, a: false, s: false, d: false })
 const tapMode = ref(false)
 const tapVx   = ref(0)
 const tapWz   = ref(0)
-const TAP_VX_STEP = 0.05
-const TAP_WZ_STEP = 0.1
+
+/**
+ * v11.1 防锁死修复：
+ * tapMode 步长不再写死。直接使用 linearSpeed / angularSpeed（速度滑条）作为
+ * 单次按键的增量，这样：
+ *   1. 滑条调小 → 点按一次的速度变化也变小，"调速滑条对点按生效"。
+ *   2. 滑条调大 → 点按一次直接到目标速度，避免连按累加到危险高速。
+ * 同时保留最大不超过 ROBOT_MAX_* 的硬上限。
+ */
+function getTapVxStep(): number {
+  return Math.min(Math.max(linearSpeed.value, 0.01), ROBOT_MAX_LINEAR_VEL)
+}
+function getTapWzStep(): number {
+  return Math.min(Math.max(angularSpeed.value, 0.01), ROBOT_MAX_ANGULAR_VEL)
+}
+
+/**
+ * v11.1 防锁死修复：tapMode 自动清零定时器
+ *
+ * 现象：点按一次"前进"后 tapVx 保持非零，sendLoop 每 50ms 持续向后端发非零
+ *       /cmd_vel，导致小车一直走（"按一下就锁死"）。
+ * 修复：每次 tapStep 调用都重启一个 TAP_AUTO_ZERO_MS 倒计时；倒计时到期且
+ *       tapVx/tapWz 仍非零则强制归零并发零速。等价于"3 秒内没新点按 → 停车"。
+ *       3000ms 是经验值：足够 Ackermann 完成一个小直线机动，又远小于人类
+ *       "忘了在控制车"的反应时间。
+ */
+const TAP_AUTO_ZERO_MS = 3000
+let tapAutoZeroTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearTapAutoZeroTimer() {
+  if (tapAutoZeroTimer) {
+    clearTimeout(tapAutoZeroTimer)
+    tapAutoZeroTimer = null
+  }
+}
+
+function scheduleTapAutoZero() {
+  clearTapAutoZeroTimer()
+  tapAutoZeroTimer = setTimeout(() => {
+    tapAutoZeroTimer = null
+    if (tapMode.value && (tapVx.value !== 0 || tapWz.value !== 0)) {
+      tapVx.value = 0
+      tapWz.value = 0
+      targetVx = 0
+      targetWz = 0
+      sendVelNow(0, 0)
+      addLog(`点按模式 ${TAP_AUTO_ZERO_MS / 1000}s 无新操作，自动归零`, 'warn')
+    }
+  }, TAP_AUTO_ZERO_MS)
+}
 
 function toggleMode() {
   tapMode.value = !tapMode.value
@@ -266,6 +316,7 @@ function toggleMode() {
   targetVx = 0
   targetWz = 0
   keys.value = { w: false, a: false, s: false, d: false }
+  clearTapAutoZeroTimer()
   // 切换模式时立即发一次零速
   sendVelNow(0, 0)
   addLog(`已切换到${tapMode.value ? '点按' : '长按'}模式`, 'info')
@@ -275,15 +326,15 @@ let joystick: ReturnType<typeof nipplejs.create> | null = null
 let unsubOdom: (() => void) | null = null
 
 // ── 计算属性 ──────────────────────────────────────────────────────────
+const DISPLAY_CMD_HOLD_MS = 300
+const isDisplayingCommandVelocity = computed(() => displayCmdUntil.value > Date.now())
 const displayVx = computed(() => {
-  const odom = robotStore.odomData
-  if (odom) return odom.velocity.linear_x
-  return cmdVx.value
+  if (isDisplayingCommandVelocity.value) return cmdVx.value
+  return robotStore.currentVelocity.linear_x
 })
 const displayWz = computed(() => {
-  const odom = robotStore.odomData
-  if (odom) return odom.velocity.angular_z
-  return cmdWz.value
+  if (isDisplayingCommandVelocity.value) return cmdWz.value
+  return robotStore.currentVelocity.angular_z
 })
 const displayPose = computed(() => {
   const p = robotStore.currentPose
@@ -297,6 +348,23 @@ function velBarClass(val: number) {
   if (abs > 0.6) return 'high'
   if (abs > 0.2) return 'mid'
   return 'low'
+}
+function velBarWidth(val: number, max: number) {
+  return Math.min(Math.abs(val) / max * 100, 100) + '%'
+}
+
+function updateCommandDisplay(vx: number, wz: number) {
+  cmdVx.value = vx
+  cmdWz.value = wz
+  displayCmdUntil.value = Date.now() + DISPLAY_CMD_HOLD_MS
+
+  if (displayCmdTimer) clearTimeout(displayCmdTimer)
+  displayCmdTimer = setTimeout(() => {
+    displayCmdTimer = null
+    if (Date.now() >= displayCmdUntil.value) {
+      displayCmdUntil.value = 0
+    }
+  }, DISPLAY_CMD_HOLD_MS)
 }
 
 // ── 控制参数 ──────────────────────────────────────────────────────────
@@ -344,6 +412,22 @@ let _sentWz = 0
 // 急停状态标志：true 时 sendLoop 跳过，防止定时器覆盖急停
 let _estopActive = false
 
+/**
+ * v11.1 防锁死修复：用户最近一次有效输入时间戳 + 硬超时
+ *
+ * 现象：tapMode 或长按模式下，sendLoop 每 50ms 把 targetVx/Wz 持续发往后端，
+ *       一旦上层逻辑因 bug（如 pointer 丢失、按键卡住）忘了归零，
+ *       小车就会持续运动直到撞到东西或人按急停。
+ * 修复：每次"用户主动输入"刷新 lastUserInputTs；sendLoop 每帧检查，
+ *       若处于非零速且距上次输入超过 SEND_HARD_TIMEOUT_MS（5 秒），
+ *       无条件归零并发零速。
+ */
+const SEND_HARD_TIMEOUT_MS = 5000
+let lastUserInputTs = 0
+function markUserInput() {
+  lastUserInputTs = Date.now()
+}
+
 // ── 核心发送函数 ──────────────────────────────────────────────────────
 /**
  * 立即发送速度（主通道：WebSocket；fallback：HTTP）
@@ -351,8 +435,7 @@ let _estopActive = false
  * 只有 WebSocket 断开时才 fallback 到 HTTP。
  */
 function sendVelNow(vx: number, wz: number) {
-  cmdVx.value = vx
-  cmdWz.value = wz
+  updateCommandDisplay(vx, wz)
   _sentVx = vx
   _sentWz = wz
 
@@ -369,8 +452,7 @@ function sendVelNow(vx: number, wz: number) {
  * 不再额外调用 setVelocity(0,0,0)，避免竞态覆盖
  */
 function doForceStop() {
-  cmdVx.value = 0
-  cmdWz.value = 0
+  updateCommandDisplay(0, 0)
   _sentVx = 0
   _sentWz = 0
   targetVx = 0
@@ -398,10 +480,12 @@ function initJoystick() {
   joystick.on('start', () => {
     joystickActive = true
     _estopActive = false
+    markUserInput()
   })
 
   joystick.on('move', (_evt: any, data: any) => {
     if (_estopActive) return
+    markUserInput()
     const force = Math.min(data.force, 1)
     if (force < JOYSTICK_DEADZONE) {
       targetVx = 0
@@ -440,6 +524,7 @@ function initJoystick() {
 function onDpadDown(e: PointerEvent, key: 'w' | 'a' | 's' | 'd') {
   ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
   if (_estopActive) return
+  markUserInput()
   if (tapMode.value) {
     tapStep(key)
   } else {
@@ -463,14 +548,20 @@ function onDpadUp(key: 'w' | 'a' | 's' | 'd') {
 
 function tapStep(key: 'w' | 'a' | 's' | 'd') {
   if (_estopActive) return
+  markUserInput()
   const maxVx = ROBOT_MAX_LINEAR_VEL
   const maxWz = ROBOT_MAX_ANGULAR_VEL
-  if (key === 'w') tapVx.value = Math.min(tapVx.value + TAP_VX_STEP, maxVx)
-  if (key === 's') tapVx.value = Math.max(tapVx.value - TAP_VX_STEP, -maxVx)
-  if (key === 'a') tapWz.value = Math.min(tapWz.value + TAP_WZ_STEP, maxWz)
-  if (key === 'd') tapWz.value = Math.max(tapWz.value - TAP_WZ_STEP, -maxWz)
+  // v11.1：步长来源于滑条而不是常量，滑条调速对点按生效
+  const stepVx = getTapVxStep()
+  const stepWz = getTapWzStep()
+  if (key === 'w') tapVx.value = Math.min(tapVx.value + stepVx, maxVx)
+  if (key === 's') tapVx.value = Math.max(tapVx.value - stepVx, -maxVx)
+  if (key === 'a') tapWz.value = Math.min(tapWz.value + stepWz, maxWz)
+  if (key === 'd') tapWz.value = Math.max(tapWz.value - stepWz, -maxWz)
   targetVx = tapVx.value
   targetWz = tapWz.value
+  // v11.1：每次点按都重启自动归零倒计时，TAP_AUTO_ZERO_MS 秒无新操作 → 自动停车
+  scheduleTapAutoZero()
   addLog(`点按 ${key.toUpperCase()}: vx=${tapVx.value.toFixed(2)}, wz=${tapWz.value.toFixed(2)}`, 'info')
 }
 
@@ -490,10 +581,12 @@ function onKeyDown(e: KeyboardEvent) {
     if (k === 's' || k === 'arrowdown')  { tapStep('s'); e.preventDefault() }
     if (k === 'd' || k === 'arrowright') { tapStep('d'); e.preventDefault() }
   } else {
-    if (k === 'w' || k === 'arrowup')    { keys.value.w = true; e.preventDefault() }
-    if (k === 'a' || k === 'arrowleft')  { keys.value.a = true; e.preventDefault() }
-    if (k === 's' || k === 'arrowdown')  { keys.value.s = true; e.preventDefault() }
-    if (k === 'd' || k === 'arrowright') { keys.value.d = true; e.preventDefault() }
+    let hit = false
+    if (k === 'w' || k === 'arrowup')    { keys.value.w = true; hit = true; e.preventDefault() }
+    if (k === 'a' || k === 'arrowleft')  { keys.value.a = true; hit = true; e.preventDefault() }
+    if (k === 's' || k === 'arrowdown')  { keys.value.s = true; hit = true; e.preventDefault() }
+    if (k === 'd' || k === 'arrowright') { keys.value.d = true; hit = true; e.preventDefault() }
+    if (hit) markUserInput()
   }
 }
 
@@ -555,7 +648,21 @@ function startSendLoop() {
       // tap 模式：targetVx/Wz 由 tapStep 直接写入
     }
 
+    // v11.1 防锁死硬超时兜底：连续非零速且距上次用户输入超 SEND_HARD_TIMEOUT_MS 强制归零
+    // 这是最后一道防线，即使 tapStep 自动归零定时器 / pointer 事件全部失效，
+    // SEND_HARD_TIMEOUT_MS 秒后仍能保证不会持续向小车发送非零速度。
     if (targetVx !== 0 || targetWz !== 0) {
+      if (lastUserInputTs > 0 && Date.now() - lastUserInputTs > SEND_HARD_TIMEOUT_MS) {
+        targetVx = 0
+        targetWz = 0
+        tapVx.value = 0
+        tapWz.value = 0
+        keys.value = { w: false, a: false, s: false, d: false }
+        clearTapAutoZeroTimer()
+        sendVelNow(0, 0)
+        addLog(`前端硬超时：${SEND_HARD_TIMEOUT_MS / 1000}s 无新输入，自动停车`, 'warn')
+        return
+      }
       // 非零速：每帧都发，保持电机持续运转
       sendVelNow(targetVx, targetWz)
     } else {
@@ -584,6 +691,7 @@ function emergencyStop() {
   tapVx.value = 0
   tapWz.value = 0
   joystickActive = false
+  clearTapAutoZeroTimer()
 
   // 双通道发送急停
   doForceStop()
@@ -628,6 +736,7 @@ function safeStopOnly(reason: string) {
   joystickActive = false
   targetVx = 0
   targetWz = 0
+  clearTapAutoZeroTimer()
   // 直接发零速（双通道：WS + HTTP fallback）
   sendVelNow(0, 0)
   controlApi.setVelocity(0, 0, 0).catch(() => {})
@@ -640,18 +749,56 @@ function safeStopOnly(reason: string) {
  */
 function hardEstop(reason: string) {
   _estopActive = true
+  clearTapAutoZeroTimer()
   doForceStop()
   setTimeout(() => { _estopActive = false }, 300)
   addLog(`强制急停：${reason}`, 'error')
 }
 
-function onVisibilityChange() {
-  if (document.visibilityState === 'hidden') {
-    safeStopOnly('页面隐藏')
+// ── v11.2 修复"按下 W/S 电机转一会停一会"问题 ───────────────────────
+// 现象：用户长按 W 时，会下意识把鼠标移到浏览器窗口外去看小车，
+//   或者快速切窗口/Alt+Tab，导致 onMouseLeave / onWindowBlur 触发
+//   safeStopOnly → keys 被清空 → 必须松开重按才能继续走。
+// 修复策略：
+//   1. 完全移除 onMouseLeave 监听（鼠标飘出窗口属于正常使用场景）。
+//   2. onWindowBlur 添加 800ms 抖动窗口：失焦后等 800ms 再判定是否
+//      仍处于失焦状态，避免瞬时切窗口造成误停。
+//   3. visibilitychange（页面真正进入后台/最小化）保持原逻辑立即停。
+let blurStopTimer: ReturnType<typeof setTimeout> | null = null
+const BLUR_STOP_DEBOUNCE_MS = 800
+
+function clearBlurStopTimer() {
+  if (blurStopTimer) {
+    clearTimeout(blurStopTimer)
+    blurStopTimer = null
   }
 }
-function onWindowBlur()  { safeStopOnly('窗口失焦') }
-function onMouseLeave()  { safeStopOnly('鼠标离开窗口') }
+
+function onVisibilityChange() {
+  if (document.visibilityState === 'hidden') {
+    // 页面真正被隐藏（切到后台/最小化）才立即停
+    clearBlurStopTimer()
+    safeStopOnly('页面隐藏')
+  } else {
+    // 回到前台：取消还在排队的 blur 停车
+    clearBlurStopTimer()
+  }
+}
+function onWindowBlur() {
+  // 失焦后启动 800ms 抖动窗口：期间若 focus 回来则取消停车
+  clearBlurStopTimer()
+  blurStopTimer = setTimeout(() => {
+    blurStopTimer = null
+    // 只在仍处于失焦状态时执行停车
+    if (!document.hasFocus()) {
+      safeStopOnly('窗口失焦')
+    }
+  }, BLUR_STOP_DEBOUNCE_MS)
+}
+function onWindowFocus() {
+  // 用户回到窗口：取消任何正在排队的 blur 停车
+  clearBlurStopTimer()
+}
 function onPageHide()    { hardEstop('页面卸载/导航离开') }
 function onBeforeUnload(){
   hardEstop('浏览器关闭')
@@ -665,9 +812,11 @@ onMounted(() => {
   window.addEventListener('keyup', onKeyUp)
 
   // ── 失焦/可见性/卸载安全钩子 ──
+  // v11.2：移除 document.mouseleave（鼠标飘出浏览器属于正常操作）
+  //         window.blur 加抖动 + focus 撤销，避免瞬时切窗口误停车
   document.addEventListener('visibilitychange', onVisibilityChange)
   window.addEventListener('blur', onWindowBlur)
-  document.addEventListener('mouseleave', onMouseLeave)
+  window.addEventListener('focus', onWindowFocus)
   window.addEventListener('pagehide', onPageHide)
   window.addEventListener('beforeunload', onBeforeUnload)
 
@@ -694,10 +843,13 @@ onUnmounted(() => {
   window.removeEventListener('keyup', onKeyUp)
   document.removeEventListener('visibilitychange', onVisibilityChange)
   window.removeEventListener('blur', onWindowBlur)
-  document.removeEventListener('mouseleave', onMouseLeave)
+  window.removeEventListener('focus', onWindowFocus)
   window.removeEventListener('pagehide', onPageHide)
   window.removeEventListener('beforeunload', onBeforeUnload)
+  clearBlurStopTimer()
   if (sendTimer) clearInterval(sendTimer)
+  clearTapAutoZeroTimer()
+  if (displayCmdTimer) clearTimeout(displayCmdTimer)
   if (unsubOdom) unsubOdom()
   if (unsubWsStatus) unsubWsStatus()
   // 离开/切换路由：双通道发送停车（含 SafetyGate 急停锁）

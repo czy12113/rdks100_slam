@@ -22,7 +22,7 @@ from app.core.websocket_manager import ws_manager
 from app.services.data_pusher import start_all_push_tasks
 from app.services.ros2_bridge import ros2_bridge
 from app.services.safety_gate import safety_gate
-from app.api import control, slam, navigation, device
+from app.api import control, slam, navigation, device, vlm
 
 # -----------------------------------------------------------------------------
 # 日志配置
@@ -106,6 +106,7 @@ app.include_router(control.router)
 app.include_router(slam.router)
 app.include_router(navigation.router)
 app.include_router(device.router)
+app.include_router(vlm.router)
 
 
 # -----------------------------------------------------------------------------

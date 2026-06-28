@@ -135,6 +135,24 @@ export const deviceApi = {
 }
 
 // =============================================================================
+// VLM 场景理解 API
+// vlm_node（ROS2 节点）会订阅 D435i 相机帧 + DOSOD/YOLO 检测框，按关键帧策略
+// 调用 Qwen-VL / DeepSeek-Text 等 Provider 输出自然语言描述。
+// 后端只做转发与历史聚合，所有推理在 ROS2 节点内完成。
+// =============================================================================
+export const vlmApi = {
+  /** 获取 VLM 节点状态（provider、统计、最近错误） */
+  getStatus: () => http.get('/api/vlm/status'),
+  /** 获取最新一条场景描述 */
+  getLatest: () => http.get('/api/vlm/latest'),
+  /** 获取历史描述（默认 20 条，最多 50） */
+  getHistory: (limit: number = 20) => http.get(`/api/vlm/history?limit=${limit}`),
+  /** 手动触发一次 VLM 推理（可选自定义 prompt） */
+  ask: (prompt: string = '', timeout_sec: number = 15) =>
+    http.post('/api/vlm/ask', { prompt, timeout_sec }, { timeout: (timeout_sec + 5) * 1000 }),
+}
+
+// =============================================================================
 // 系统 API
 // =============================================================================
 export const systemApi = {

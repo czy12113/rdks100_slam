@@ -65,15 +65,28 @@ class WebSocketManager:
         "robot_status",       # 机器人状态（电量/速度/模式）
         "lidar",              # 激光雷达数据
         "imu",                # IMU 姿态数据
+        "odom",               # 里程计
         "slam_map",           # SLAM 地图数据
         "slam_pose",          # SLAM 位姿
         "video_rgb",          # RGB 原始视频帧（无标注）
         "video_annotated",    # AI 检测标注图像（带框）
         "video_depth",        # 深度视频帧
         "detection_results",  # YOLO 检测结果 JSON（目标框 + 距离）
+        "vlm_description",    # VLM 场景自然语言描述（关键帧触发）
+        "vlm_status",         # VLM 节点状态（provider/统计/错误）
         "navigation",         # 导航状态
         "log",                # 实时日志
         "heartbeat",          # 心跳
+    }
+
+    # 轻量 topic：连接建立时自动订阅（数据量小，不影响性能）
+    # 重型 topic（lidar/video_*/slam_map）由前端按页面显式 subscribe
+    DEFAULT_TOPICS = {
+        "system",
+        "robot_status",
+        "heartbeat",
+        "log",
+        "odom",
     }
 
     def __init__(self):
@@ -87,7 +100,14 @@ class WebSocketManager:
         self._lock = asyncio.Lock()
 
     async def connect(self, ws: WebSocket, topics: Optional[List[str]] = None):
-        """接受新连接并订阅指定 topic"""
+        """
+        接受新连接并订阅指定 topic。
+
+        - 若 topics 显式传入（如 /ws/lidar,imu）：按列表订阅；
+        - 否则：只订阅轻量 DEFAULT_TOPICS。重型 topic（lidar/video_*/slam_map）
+          需要前端进入对应页面时主动 subscribe，离开时 unsubscribe。
+          这样浏览器空闲页面不会被点云/视频 JSON 灌满。
+        """
         async with self._lock:
             if self._total_connections >= WS_MAX_CONNECTIONS:
                 await ws.close(code=1008, reason="连接数已达上限")
@@ -96,12 +116,13 @@ class WebSocketManager:
             self._total_connections += 1
             self._client_topics[ws] = set()
 
-        # 默认订阅所有 topic
-        subscribe_list = topics if topics else list(self.TOPICS)
+        subscribe_list = topics if topics else list(self.DEFAULT_TOPICS)
         for topic in subscribe_list:
             await self.subscribe(ws, topic)
 
-        logger.info(f"[WS] 新连接，总连接数: {self._total_connections}，订阅: {subscribe_list}")
+        logger.info(
+            f"[WS] 新连接，总连接数: {self._total_connections}，订阅: {subscribe_list}"
+        )
         return True
 
     async def disconnect(self, ws: WebSocket):
@@ -144,11 +165,25 @@ class WebSocketManager:
             self._client_topics[ws].discard(topic)
 
     async def broadcast(self, topic: str, data: dict):
-        """向指定 topic 的所有订阅者广播消息"""
+        """向指定 topic 的所有订阅者广播消息
+
+        ⚠️ 当 topic 无任何订阅者时直接返回，避免后端在没人观看的情况下
+           继续 dump 重型数据（点云/视频）。data_pusher 中重型推送任务
+           应该先调用 has_subscribers() 判断后再生成数据，进一步避免
+           上游 JSON/base64 编码的 CPU 浪费。
+        """
         if topic not in self._groups:
             return
+        group = self._groups[topic]
+        if not group.connections:
+            return
         message = {"topic": topic, "data": data}
-        await self._groups[topic].broadcast(message)
+        await group.broadcast(message)
+
+    def has_subscribers(self, topic: str) -> bool:
+        """是否有任意客户端订阅了该 topic（供 data_pusher 提前 short-circuit）"""
+        group = self._groups.get(topic)
+        return bool(group and group.connections)
 
     async def send_to(self, ws: WebSocket, topic: str, data: dict):
         """向单个连接发送消息"""

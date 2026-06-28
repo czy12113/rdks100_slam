@@ -1,0 +1,389 @@
+阿克曼小车控制链路排查与解决方案
+日期：2026-06-28
+
+现象
+----
+前端控制界面按 W 或摇杆前进后，阿克曼底盘的两个驱动电机都会转。
+松手后两个电机仍继续转，只有断电才能停止。
+
+这个现象比“单个电机异常”更明确：不是某一路电机通道单独失控，而是“停止命令没有生效”或“电机驱动板锁存了上一次速度”。排查要按链路分层，不要直接猜硬件或软件。
+
+
+一、当前源码里的完整控制链路
+----------------------------
+1. 前端
+   文件：rdks100_slam/frontend/src/views/control/ControlView.vue
+   - 键盘 W/A/S/D、方向按钮、摇杆都会更新目标速度。
+   - 松开按键、摇杆 end、页面失焦、鼠标离开窗口都会发零速。
+   - 急停会同时走 WebSocket estop 和 HTTP /api/control/stop。
+
+2. WebSocket 客户端
+   文件：rdks100_slam/frontend/src/api/websocket.ts
+   - 普通速度帧：
+     {"action":"cmd_vel","vx":线速度,"vy":0,"wz":角速度}
+   - 急停帧：
+     {"action":"estop"}
+
+3. 后端 FastAPI
+   文件：
+   - rdks100_slam/backend/app/core/websocket_manager.py
+   - rdks100_slam/backend/app/api/control.py
+   - rdks100_slam/backend/app/services/safety_gate.py
+   - rdks100_slam/backend/app/services/ros2_bridge.py
+
+   后端流程：
+   前端 WS/HTTP -> safety_gate 限速/死区/急停锁 -> ros2_bridge.publish_cmd_vel -> ROS2 /cmd_vel。
+
+   后端还有 watchdog：
+   如果一段时间没有新手动控制命令，并且上一次是非零速度，会主动发布零速。
+
+4. ROS2 到 STM32 串口桥
+   文件：rdks100_slam/ros2_ws/src/czybot_navigation2/scripts/stm32_bridge.py
+   - 订阅 /cmd_vel，消息类型 geometry_msgs/msg/Twist。
+   - 订阅 /cmd_vel_estop，收到后连续写多帧零速。
+   - 发布 /stm32_bridge/tx_cmd，内容是实际写入串口的 [linear_mm_s, angular_mrad_s]。
+   - 串口默认 /dev/ttyUSB0，115200。
+
+   RDK 发给 STM32 的速度帧是 10 字节：
+   AA 55 01 vxL vxH wzL wzH 00 checksum 0D
+
+   零速帧应该是：
+   AA 55 01 00 00 00 00 00 01 0D
+
+5. STM32
+   文件：
+   - STM32程序文件/USER/include.h
+   - STM32程序文件/USER/ROS2Protocol.c
+   - STM32程序文件/USER/AckermannControl.c
+   - STM32程序文件/USER/I2CMotor.c
+
+   当前 include.h 里定义了 USE_ROS2_PROTOCOL，所以源码应走 ROS2 二进制协议，不是简单 ASCII W/S/A/D 协议。
+
+   STM32 处理流程：
+   USART1_IRQHandler -> ROS2Protocol_ProcessByte -> 校验帧 -> ProcessControlCmd。
+
+   当收到 vx=0 且 wz=0：
+   ProcessControlCmd -> AckermannStop -> I2CMotor_Stop。
+
+   I2CMotor_Stop 当前逻辑：
+   往电机驱动板速度寄存器写 {0,0,0,0}。
+
+
+二、基于源码的初步判断
+--------------------
+当前源码中，上位机和桥接层都有多级停机保护：
+- 前端松手发 0。
+- 后端 watchdog 发 0。
+- /cmd_vel_estop 会触发多帧 0。
+- stm32_bridge 自身超时会发 0。
+- STM32 自身 300ms 超时也会 AckermannStop。
+
+因此，如果 RDK 实际运行的就是当前源码，并且 /stm32_bridge/tx_cmd 已经显示 [0,0]，但两个电机仍然转，那么问题重点不在前端，而在 STM32 到 I2C 电机驱动板这一段。
+
+最值得怀疑的点：
+1. RDK 实际运行的是旧 install 中的旧 stm32_bridge。
+2. /cmd_vel 上还有别的发布者，松手后仍持续发布非零速度。
+3. 零速帧没有真正写到 STM32 串口。
+4. STM32 收到零速，但 I2C stop 写入失败或被电机驱动板忽略。
+5. 电机驱动板没有失控保护，断通信后保持上一次速度。
+
+
+三、现场排查前的安全要求
+----------------------
+1. 先把车轮架空，不要让车落地测试。
+2. 速度滑条调到最低可控速度。
+3. 手边保留物理断电开关。
+4. 每次只改一个变量，不要同时改前端、ROS 和 STM32。
+
+
+四、第一层：判断是不是上位机或其他 ROS 节点还在发非零速度
+--------------------------------------------------
+在 RDK 上执行：
+
+cd ~/rdks100_slam
+source /opt/ros/humble/setup.bash
+source ros2_ws/install/setup.bash
+ros2 topic info /cmd_vel -v
+
+看 /cmd_vel 的 publishers。
+
+手动前端控制时，期望：
+- 有 /stm32_bridge 作为订阅者。
+- 发布者最好只有前端后端桥，例如 /rdks100_webui_bridge。
+
+如果看到 /controller_server、teleop、其他导航节点也在发布 /cmd_vel，那么松手后小车继续走可能不是前端问题，而是另一个节点还在发非零速度。
+
+解决方案：
+1. 手动控制时关闭 Nav2/controller_server/teleop。
+2. 长期方案加速度仲裁，例如 twist_mux：
+   - manual_cmd_vel 优先级高。
+   - nav_cmd_vel 优先级低。
+   - estop 最高优先级。
+3. 或者把导航输出改到 /cmd_vel_nav，再由一个仲裁节点统一输出 /cmd_vel。
+
+
+五、第二层：同时看 /cmd_vel 和串口桥实际发送值
+------------------------------------------
+开两个终端。
+
+终端 1：
+ros2 topic echo /cmd_vel
+
+终端 2：
+ros2 topic echo /stm32_bridge/tx_cmd
+
+然后在前端按 W，再松手。
+
+期望现象：
+1. 按下 W：
+   /cmd_vel.linear.x 为正数，例如 0.25。
+   /stm32_bridge/tx_cmd 为 [250, 0] 或接近值。
+
+2. 松手：
+   /cmd_vel 变成 0。
+   /stm32_bridge/tx_cmd 出现 [0, 0]。
+
+判定：
+1. 松手后 /cmd_vel 仍是非零：
+   问题在前端实际运行版本、后端或其他 ROS 发布者。
+
+2. 松手后 /cmd_vel 是 0，但 /stm32_bridge/tx_cmd 仍是非零：
+   问题在 stm32_bridge 或 RDK 运行的 ROS2 install 版本。
+
+3. 松手后 /stm32_bridge/tx_cmd 已经出现 [0,0]，但两个电机继续转：
+   问题在 STM32、I2C 电机驱动板或硬件。
+
+
+六、第三层：绕过前端，直接用 ROS2 控制测试
+--------------------------------------
+目的：判断前端是否参与了故障。
+
+车轮架空后执行：
+
+ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.20}, angular: {z: 0.0}}"
+
+观察两个电机是否转。
+
+然后执行：
+
+ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.0}, angular: {z: 0.0}}"
+
+再执行急停 topic：
+
+ros2 topic pub --once /cmd_vel_estop std_msgs/msg/Empty "{}"
+
+判定：
+1. 直接 ROS2 发零速能停：
+   前端或后端实际运行版本有问题。
+
+2. 直接 ROS2 发零速不能停，但 /stm32_bridge/tx_cmd 有 [0,0]：
+   前端无关，问题在 STM32 或电机驱动板。
+
+3. /cmd_vel_estop 也不能停：
+   基本可以排除普通前端松手逻辑，重点查下位机 stop 执行和硬件。
+
+
+七、第四层：确认 RDK 是否运行旧 install
+----------------------------------
+deploy.sh 会排除本地 ros2_ws/build、ros2_ws/install、ros2_ws/log。
+也就是说，本地源码传到 RDK 后，RDK 端如果不重新 colcon build，就可能继续使用旧 install 里的 stm32_bridge。
+
+在 RDK 上执行：
+
+cd ~/rdks100_slam/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select czybot_navigation2 --symlink-install
+source install/setup.bash
+ros2 pkg prefix czybot_navigation2
+
+期望 ros2 pkg prefix 输出路径在：
+~/rdks100_slam/ros2_ws/install/czybot_navigation2
+
+如果 prefix 指向别的工作区，说明当前 shell 或启动脚本 source 了错误的 install。
+
+解决方案：
+1. RDK 端重新 colcon build。
+2. 重启启动该 launch 的终端或服务。
+3. 启动前显式 source：
+   source /opt/ros/humble/setup.bash
+   source ~/rdks100_slam/ros2_ws/install/setup.bash
+4. 再次 ros2 node info /stm32_bridge 确认节点存在。
+
+
+八、第五层：判断 STM32 是否收到零速帧
+--------------------------------
+如果 /stm32_bridge/tx_cmd 出现 [0,0]，只能说明 RDK 写串口了，不代表 STM32 一定解析成功。
+
+需要确认：
+1. STM32 烧录的固件是否就是当前 ROS2 协议版。
+   当前源码里 include.h 有 #define USE_ROS2_PROTOCOL。
+
+2. USART1 是否接在 RDK 的 USB 转串口上。
+   RDK 默认 /dev/ttyUSB0，但现场多个串口设备时 ttyUSB 编号可能变化。
+
+3. 建议用固定路径：
+   ls -l /dev/serial/by-id/
+   然后 launch 时把 stm32_port 指到 /dev/serial/by-id/xxx，而不是 /dev/ttyUSB0。
+
+解决方案：
+1. 重新烧录当前 STM32 工程生成的 hex。
+2. 固定串口 by-id，避免重启后 ttyUSB0/ttyUSB1 对调。
+3. 如有逻辑分析仪，抓 STM32 RX，确认松手后是否有：
+   AA 55 01 00 00 00 00 00 01 0D
+
+
+九、第六层：STM32 到 I2C 电机驱动板的重点风险
+----------------------------------------
+当前 STM32 逻辑中，AckermannStop 会调用 I2CMotor_Stop。
+I2CMotor_Stop 只是写一次 {0,0,0,0}，且没有检查 I2C_Write_Len 的返回值。
+
+这很危险：
+1. 如果 I2C 总线偶发 NACK，STM32 仍认为已经停止。
+2. 如果电机驱动板锁存了上一次速度，一次 stop 写失败后，电机就会一直转。
+3. AckermannTask 后续看到当前目标已经是 0，就不会持续重复发送 stop。
+4. 这和“松手不停，断电才停”的现象高度吻合。
+
+软件解决方案：
+1. 把 I2CMotor_Stop 改成返回写入是否成功。
+2. stop 失败时不要把 motorOutputValid 设置为 1。
+3. AckermannStop 后持续重发 stop，例如 5 次，每次间隔 2ms 到 10ms。
+4. 在 40ms motor task 中，如果处于 stop 状态但上次 stop 写失败，继续重试。
+5. 急停、超时、零速三种路径都调用同一个可靠 stop 函数。
+
+建议的固件设计方向：
+- I2CMotor_StopReliable()
+  连续写 {0,0,0,0} 多次。
+  每次检查 I2C_Write_Len 返回值。
+  至少有一次成功才认为 stop 成功。
+
+- AckermannStop()
+  targetMotorSpeed = 0
+  currentMotorSpeed = 0
+  stop_retry_pending = 1
+  不要只发一次 stop 就结束。
+
+- AckermannTask()
+  如果 stop_retry_pending 为 1，持续补发 stop，直到成功或达到次数上限。
+
+硬件解决方案：
+1. 电机驱动板必须有硬件 EN/使能脚，由 STM32 控制。
+2. 急停和通信超时时，不只写速度 0，还要拉低 EN。
+3. EN 脚加下拉，STM32 复位或死机时默认关闭电机。
+4. 如果驱动板没有 EN 或刹车输入，建议换有 fail-safe 的电机驱动板。
+
+
+十、第七层：硬件排查
+------------------
+因为两个电机都松手后继续转，优先怀疑“驱动板继续保持上一次速度”或“stop 指令没有被驱动板执行”。
+
+检查项：
+1. 电机驱动板供电是否稳定。
+   电机启动瞬间压降可能导致 I2C 通信异常。
+
+2. STM32 与电机驱动板是否共地。
+   共地不良会导致 I2C 写入偶发失败。
+
+3. I2C SDA/SCL 是否有合适上拉。
+   线太长、电机干扰大、上拉不合适都会导致 NACK。
+
+4. 电机驱动板是否有通信失联保持速度的特性。
+   有些板子收到速度后会一直执行，直到收到新的速度或断电。
+
+5. 电机驱动板地址是否正确。
+   I2CMotor.c 使用 CAM_DEFAULT_I2C_ADDRESS，确认和实际驱动板一致。
+
+6. 断开 RDK，只用 STM32 本地测试 stop。
+   烧一个最小测试：
+   - 初始化 I2C 和电机。
+   - SetSpeed(30) 运行 1 秒。
+   - Stop()。
+   如果本地测试也停不下来，问题与上位机无关。
+
+7. 交换两路电机线。
+   如果故障跟着电机走，是电机或线的问题。
+   如果故障固定在驱动板通道，是驱动板通道问题。
+   如果两个都一样，是驱动板控制逻辑或 stop 命令问题。
+
+
+十一、上位机侧可做的增强
+----------------------
+即使最终问题在下位机，上位机也建议增强：
+
+1. stm32_bridge 在普通松手归零时，不只写一帧 [0,0]，而是在 300ms 内连续写零速。
+   这样即使某一帧串口丢失，STM32 也更容易收到。
+
+2. 后端 /api/control/stop 和 WS estop 已经会多发零速，建议前端松手路径也可以触发短零速 burst。
+
+3. 在前端页面显示最近一次 /stm32_bridge/tx_cmd，便于现场判断是不是已经给下位机发了 0。
+
+4. 给 stm32_bridge 增加版本号日志。
+   启动时打印版本，例如 [stm32_bridge vX]，避免 RDK 运行旧 install 时无法发现。
+
+
+十二、推荐执行顺序
+----------------
+按这个顺序做，最快定位：
+
+1. 架空车轮。
+2. RDK 上执行 ros2 topic info /cmd_vel -v，看有没有多个发布者。
+3. 同时 echo /cmd_vel 和 /stm32_bridge/tx_cmd。
+4. 前端按 W 松手，看 /cmd_vel 和 /stm32_bridge/tx_cmd 是否变 0。
+5. 如果 /cmd_vel 不变 0，查前端实际 dist、后端、其他发布者。
+6. 如果 /cmd_vel 变 0 但 tx_cmd 不变 0，重编译 RDK 端 ros2_ws/install。
+7. 如果 tx_cmd 已经是 [0,0] 但电机不停，直接转 STM32/I2C/电机驱动板。
+8. 发布 /cmd_vel_estop 测试急停。
+9. 急停仍不停时，优先改 STM32 的可靠 stop 和检查电机驱动 EN。
+10. 最后再做硬件隔离测试：共地、I2C 上拉、驱动板地址、驱动板通道、电源压降。
+
+
+十三、按结果给出的解决方案总表
+----------------------------
+结果 A：
+/cmd_vel 松手后仍非零。
+
+原因：
+前端实际运行版本旧、后端没有收到松手、或 Nav2/teleop 仍在发布速度。
+
+解决：
+关闭其他 /cmd_vel 发布者；检查浏览器 WebSocket 是否发 {"vx":0,"wz":0}；RDK 端重新构建前端；必要时引入 twist_mux 仲裁。
+
+
+结果 B：
+/cmd_vel 为 0，但 /stm32_bridge/tx_cmd 仍非零。
+
+原因：
+RDK 运行旧 stm32_bridge、source 了错误 install、或 stm32_bridge 内部状态异常。
+
+解决：
+RDK 端 colcon build --packages-select czybot_navigation2 --symlink-install；确认 ros2 pkg prefix；重启 launch。
+
+
+结果 C：
+/stm32_bridge/tx_cmd 已经是 [0,0]，但电机不停。
+
+原因：
+STM32 没解析到零速帧、USART 线/串口错、STM32 固件不是 ROS2 协议版、I2C stop 失败、电机驱动板锁存速度。
+
+解决：
+固定 /dev/serial/by-id；重新烧录当前 ROS2 协议固件；逻辑分析仪抓 RX；改 STM32 可靠 stop；增加电机驱动 EN 硬件关断。
+
+
+结果 D：
+直接 STM32 本地 SetSpeed 后 Stop 也停不下来。
+
+原因：
+上位机完全无关，问题在 STM32 I2C、电机驱动板或硬件接线。
+
+解决：
+检查 I2C 返回值、上拉、共地、电源压降、驱动板地址；替换电机驱动板或使用 EN 硬件急停。
+
+
+最终建议
+--------
+你这个“两个驱动电机都在松手后继续转，断电才停”的描述，最像以下两种：
+
+1. /cmd_vel 上有其他发布者或 RDK 运行旧 install，导致零速没有真正到 stm32_bridge。
+2. 零速已经到 STM32，但 I2C stop 是一次性写入且没有错误处理，电机驱动板继续保持上一次速度。
+
+不要先改前端。先用 /cmd_vel 和 /stm32_bridge/tx_cmd 把问题切开。
+如果 tx_cmd 已经有 [0,0]，就集中处理 STM32 的可靠 stop 和电机驱动板硬件 fail-safe。

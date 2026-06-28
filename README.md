@@ -12,23 +12,37 @@
 | IMU 姿态 | Three.js 3D 姿态展示、加速度(g)/角速度(rad/s)曲线、互补滤波姿态解算（v5.0 真实接入） |
 | 机器人控制 | 虚拟摇杆、WASD 键盘、长按/点按双模式、速度调节、急停、里程计实时显示（v9.0 SafetyGate + 多层安全停车） |
 | 目标检测 | YOLOv5 目标检测 + D435i 深度测距，带框+距离标注视频推送（v6.0 新增） |
+| 场景理解 | VLM 视觉语言场景理解：D435i 关键帧 + 检测框 → Qwen-VL → 自然语言描述（v12.0 新增） |
 | SLAM 建图 | Cartographer 2D/3D 建图（v7.0 真实接入 + v9.0 重影二次优化）、占据栅格地图、轨迹、地图保存/加载 |
 | 导航规划 | Nav2 实车导航链路接入（v10.0，SmacPlanner2D + MPPI Ackermann，联调未完全成功） |
 | 设备管理 | 设备信息、传感器状态、参数配置 |
 
-## v10.0 更新摘要
+## v12.0 更新摘要
 
-v10.0 基于 v9.0 的手动控制安全闭环和 SLAM 地图结果，新增小车实车导航联调存档。当前已经把 `czybot_navigation2/launch/livox_navigation.launch.py` 作为一键入口，串起 STM32、Livox、点云转 LaserScan、scan 去重/过滤、Nav2、RViz；但导航还没有完全成功，短距离目标、到点稳定性、costmap 误报和底盘执行链路仍需继续现场调参。
+v12.0 在现有 D435i 相机、YOLO/DOSOD 检测、FastAPI WebSocket 和 Vue3 视频监控链路上接入 VLM（视觉语言模型）场景理解。新增 ROS2 包 `vlm_scene`，由 `vlm_node` 订阅 RGB 图像与 `/detection/results`，通过关键帧节流调用 Qwen-VL/OpenAI 兼容 provider，输出 `/vlm/scene_description` 与 `/vlm/status`；后端新增 VLM API、ROS2Bridge 订阅与 WebSocket 推送；前端取消独立 `/vlm` 页面，把“场景理解”面板嵌入 `VideoView.vue` 的视频监控页。
 
-现场联调命令：
+当前 VLM 数据链路：
+
+```
+D435i 相机 → YOLO/DOSOD 检测 → vlm_node 关键帧节流
+  → Qwen-VL API → 自然语言描述
+  → ROS topic + FastAPI WebSocket → 前端 VideoView 场景理解面板
+```
+
+板端启动顺序：
 
 ```bash
-cd ~/rdks100_slam/ros2_ws
-colcon build --symlink-install --packages-select czybot_navigation2 czybot_slam
+# 终端 A：后端 + 相机 + 检测
+cd /home/sunrise/rdks100_slam
+./start.sh prod
+
+# 终端 B：VLM 场景理解节点
+cd /home/sunrise/rdks100_slam/ros2_ws
 source install/setup.bash
-ros2 launch czybot_navigation2 livox_navigation.launch.py \
-    map:=/home/sunrise/rdks100_slam/my_map/map_20260625_162331.yaml \
-    use_rviz:=true
+ros2 launch vlm_scene vlm.launch.py
+
+# 终端 C：浏览器访问
+http://10.21.1.145:8000/#/video
 ```
 
 ## 目录结构
@@ -48,6 +62,7 @@ rdks100_slam/
 │   │       ├── control.py    # 速度控制（线速度+角速度双斜坡加速度限幅）
 │   │       ├── slam.py
 │   │       ├── navigation.py
+│   │       ├── vlm.py        # VLM 状态/最新结果/历史/手动 ask API（v12.0）
 │   │       └── device.py
 │   ├── main.py
 │   ├── requirements.txt
@@ -68,6 +83,12 @@ rdks100_slam/
 │       ├── d435i_detection/       # YOLOv5 目标检测+深度测距（v6.0 新增）
 │       │   ├── d435i_detection/detection_node.py  # 核心检测节点（双缓冲+独立推理线程）
 │       │   └── launch/detection.launch.py          # 一键启动相机+检测
+│       ├── vlm_scene/             # VLM 场景理解（v12.0 新增，Qwen-VL/OpenAI/mock provider）
+│       │   ├── vlm_scene/vlm_node.py
+│       │   ├── vlm_scene/providers/
+│       │   ├── vlm_scene/utils/
+│       │   ├── config/vlm_params.yaml
+│       │   └── launch/vlm.launch.py
 │       ├── czybot_navigation2/    # 机器人运动控制/Nav2（STM32 串口桥接 + 阿克曼导航参数）
 │       │   └── scripts/
 │       │       ├── stm32_bridge.py           # STM32 串口桥接节点（v9.0 限速/急停/watchdog）
@@ -428,6 +449,27 @@ ros2 launch d435i_detection detection.launch.py camera:=false
 > **说明**：yolov5s CPU 推理 ~2FPS。发布 `/detection/results`（JSON）和 `/detection/annotated_image`（BGR8 带框+距离）。
 > 后端 `data_pusher.push_video()` 三级降级：ros2_annotated → ros2 → mock。
 
+### VLM 场景理解（v12.0 新增）
+
+相机和检测节点启动后，启动 VLM 节点：
+
+```bash
+cd ~/rdks100_slam/ros2_ws
+colcon build --packages-select vlm_scene --symlink-install
+source install/setup.bash
+
+# 默认 provider=qwen_vl，调用 DashScope OpenAI 兼容接口
+ros2 launch vlm_scene vlm.launch.py
+
+# 离线联调前端时可切到 mock provider
+ros2 launch vlm_scene vlm.launch.py provider:=mock
+
+# 手动触发一次分析
+ros2 service call /vlm/ask std_srvs/srv/Trigger {}
+```
+
+> **说明**：VLM 节点发布 `/vlm/scene_description` 和 `/vlm/status`，前端在 `/#/video` 的“场景理解”区域展示最新描述、状态和历史记录。
+
 ### 访问
 
 启动后在局域网内任意浏览器访问：
@@ -577,6 +619,97 @@ ros2 launch d435i_bringup d435i_camera.launch.py
 
 # 5. 启动检测节点
 ros2 launch d435i_detection detection.launch.py camera:=false
+```
+
+## VLM 场景理解（v12.0 新增）
+
+`vlm_scene` 功能包把 D435i RGB 关键帧与 YOLO/DOSOD 检测结果送入视觉语言模型，输出适合前端展示或后续 TTS 播报的自然语言场景描述。
+
+### 数据流
+
+```
+/camera/camera/color/image_raw
+  + /detection/results
+    → vlm_node（关键帧节流：冷却 3s + 心跳 20s + 距离变化 0.5m）
+      → provider（qwen_vl / openai_vision / deepseek_text / internvl_local / mock）
+        → /vlm/scene_description + /vlm/status
+          → ros2_bridge → data_pusher → WebSocket
+            → VideoView.vue「场景理解」面板
+```
+
+### ROS2 包结构
+
+```
+ros2_ws/src/vlm_scene/
+├── package.xml
+├── setup.py
+├── setup.cfg
+├── config/vlm_params.yaml
+├── launch/vlm.launch.py
+├── README.md
+└── vlm_scene/
+    ├── vlm_node.py
+    ├── utils/
+    │   ├── image_ops.py
+    │   └── keyframe.py
+    └── providers/
+        ├── base.py
+        ├── factory.py
+        ├── keys.py
+        ├── qwen_vl.py
+        ├── openai_vision.py
+        ├── deepseek_text.py
+        ├── internvl_local.py
+        └── mock.py
+```
+
+### 关键设计
+
+- HTTP 调用使用 Python 标准库 `urllib`，不额外引入 `requests` 或 OpenAI SDK。
+- 图像解码由 `image_ops.py` 手写完成，不依赖 `cv_bridge`。
+- 检测数据格式与 `d435i_detection` 对齐：`class_id`、`class_name`、`confidence`、`bbox/x1y1x2y2`、`distance_m`。
+- provider 统一实现 `describe(VLMRequest) -> VLMResponse`，节点只通过 `create_provider()` 创建实例。
+- API Key 与模型名集中在 `providers/keys.py`，读取优先级为环境变量 > 文件常量 > fallback。
+- `vlm_node` 启动时只发布一次 ready 状态，后续在关键帧触发或手动 `/vlm/ask` 时更新描述。
+
+### 后端与前端接入
+
+- `backend/app/core/config.py` 新增 `ROS2_TOPIC_VLM_DESCRIPTION`、`ROS2_TOPIC_VLM_STATUS`、`ROS2_SERVICE_VLM_ASK`。
+- `backend/app/services/ros2_bridge.py` 新增 VLM topic 订阅、状态/描述解析和 `call_vlm_ask()` service client。
+- `backend/app/services/data_pusher.py` 新增 `push_vlm_description()` 与 `push_vlm_status()`。
+- `backend/app/core/websocket_manager.py` 新增 `vlm_description` 与 `vlm_status` topic。
+- `backend/app/api/vlm.py` 提供 `GET /api/vlm/status`、`GET /api/vlm/latest`、`GET /api/vlm/history?limit=20`、`POST /api/vlm/ask`。
+- `frontend/src/views/video/VideoView.vue` 在视频监控页嵌入“场景理解”区域，包含状态 tag、立即分析按钮、描述卡片、手动 prompt 和历史折叠面板。
+- 独立 `/vlm` 路由已删除，`vlm_description` 按需订阅，`vlm_status` 默认自动订阅。
+
+### 板端部署
+
+```bash
+# 本地部署
+bash /home/kkk/rdks100_slam/deploy.sh
+
+# 板端首次依赖
+ssh sunrise@10.21.1.145
+sudo apt install -y ros-humble-std-srvs
+source /home/sunrise/rdks100_slam/backend/venv/bin/activate
+pip install --no-cache-dir opencv-python-headless==4.8.1.78 numpy
+deactivate
+
+# 编译 VLM 包
+cd /home/sunrise/rdks100_slam/ros2_ws
+colcon build --packages-select vlm_scene --symlink-install
+source install/setup.bash
+```
+
+> 注意：前端变更需要在本地先执行 `npm run build`，再执行 `deploy.sh`。当前部署脚本排除了 `frontend/node_modules`，板端不会重新构建前端。
+
+### 验证
+
+```bash
+ros2 topic echo /vlm/status --once
+ros2 topic echo /vlm/scene_description --once
+ros2 service call /vlm/ask std_srvs/srv/Trigger {}
+curl http://10.21.1.145:8000/api/vlm/status
 ```
 
 ## SLAM 建图（v7.0 新增，v9.0 GPT修改版优化）
@@ -847,6 +980,9 @@ ROS2_TOPIC_ODOM = "/odom"
 ROS2_TOPIC_RGB_IMAGE: str = "/camera/camera/color/image_raw"              # RGB 图像（D435i 实际 topic）
 ROS2_TOPIC_DEPTH_IMAGE: str = "/camera/camera/aligned_depth_to_color/image_raw"  # 对齐深度
 ROS2_TOPIC_ANNOTATED_IMAGE: str = "/detection/annotated_image"   # YOLO 检测标注图（v6.0）
+ROS2_TOPIC_VLM_DESCRIPTION: str = "/vlm/scene_description"       # VLM 场景描述（v12.0）
+ROS2_TOPIC_VLM_STATUS: str = "/vlm/status"                       # VLM 节点状态（v12.0）
+ROS2_SERVICE_VLM_ASK: str = "/vlm/ask"                           # VLM 手动触发服务（v12.0）
 ```
 
 ### 前端配置（`frontend/src/config/index.ts`）
@@ -876,6 +1012,8 @@ export const LIDAR_Z_MAX = 2.0         // 高度过滤上限
 | `/camera/camera/aligned_depth_to_color/image_raw` | `sensor_msgs/Image` | 对齐深度图像（v6.0 真实接入） |
 | `/detection/results` | `std_msgs/String` | YOLOv5 检测结果 JSON（v6.0 新增） |
 | `/detection/annotated_image` | `sensor_msgs/Image` | 检测标注图像 BGR8（v6.0，后端→WebSocket） |
+| `/vlm/scene_description` | `std_msgs/String` | VLM 场景理解结果 JSON（v12.0 新增） |
+| `/vlm/status` | `std_msgs/String` | VLM provider、ready、耗时、错误等状态（v12.0 新增） |
 
 发布 Topic：
 
@@ -884,6 +1022,12 @@ export const LIDAR_Z_MAX = 2.0         // 高度过滤上限
 | `/cmd_vel` | `geometry_msgs/Twist` | 速度控制（由 STM32 桥接节点消费） |
 | `/cmd_vel_estop` | `geometry_msgs/Twist` | 急停兜底（后端 SafetyGate/ros2_bridge 发布） |
 | `/goal_pose` | `geometry_msgs/PoseStamped` | 导航目标 |
+
+服务：
+
+| Service | 类型 | 说明 |
+|---------|------|------|
+| `/vlm/ask` | `std_srvs/srv/Trigger` | 手动触发一次 VLM 场景分析（v12.0 新增） |
 
 ### STM32 桥接节点（`czybot_navigation2`）
 
@@ -908,12 +1052,16 @@ export const LIDAR_Z_MAX = 2.0         // 高度过滤上限
 }
 ```
 
-支持的 Topic：`system`, `robot_status`, `lidar`, `imu`, `slam_map`, `video_rgb`, `video_depth`, `video_annotated`, `detection_results`, `navigation`, `log`, `heartbeat`, `odom`
+支持的 Topic：`system`, `robot_status`, `lidar`, `imu`, `slam_map`, `video_rgb`, `video_depth`, `video_annotated`, `detection_results`, `vlm_description`, `vlm_status`, `navigation`, `log`, `heartbeat`, `odom`
 
 > **v6.0 视频推送**：
 > - `video_rgb`：纯 RGB 原图，自动选择最佳数据源（ros2 → mock），前端通过 `source` 字段区分
 > - `video_annotated`：AI 检测标注图（带绿框+距离），仅检测节点在线时推送
 > - `detection_results`：YOLO 检测结果 JSON，10Hz 推送
+>
+> **v12.0 VLM 推送**：
+> - `vlm_status`：VLM 节点 ready/provider/last_error/elapsed_ms 等状态，默认自动订阅
+> - `vlm_description`：场景自然语言描述，前端视频监控页按需订阅并保存最近历史
 
 ## 网络配置
 

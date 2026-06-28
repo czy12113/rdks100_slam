@@ -16,10 +16,12 @@ from app.core.config import (
     ROS2_TOPIC_ANNOTATED_IMAGE, ROS2_TOPIC_DETECTION_RESULTS,
     ROS2_TOPIC_ODOM, ROS2_TOPIC_PATH, ROS2_TOPIC_GOAL,
     ROS2_TOPIC_SLAM_POSE,
+    ROS2_TOPIC_VLM_DESCRIPTION, ROS2_TOPIC_VLM_STATUS, ROS2_SERVICE_VLM_ASK,
     ROS2_SERVICE_SAVE_MAP, ROS2_SERVICE_LOAD_MAP,
     ROS2_SERVICE_START_SLAM, ROS2_SERVICE_STOP_SLAM,
     ROBOT_MAX_LINEAR_VEL, ROBOT_MAX_ANGULAR_VEL,
     LIDAR_MOUNT_PITCH_DEG,
+    LIDAR_MAX_PUSH_POINTS,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,19 +127,45 @@ class ROS2Bridge:
         """
         创建所有需要的 ROS2 订阅者。
         每个订阅独立 try/except，单个失败不影响其他订阅。
+
+        QoS 策略：
+        - 高速传感器（点云/图像/IMU）：BEST_EFFORT + KEEP_LAST depth=1
+          这样后端只处理最新一帧，旧帧由 DDS 自动丢弃，不会在后端排队积压
+          导致 RDK 算力被旧帧的 JSON/base64 编码占满。
+        - 低频可靠数据（地图/里程计/电池/路径/检测结果）：RELIABLE depth=10
+          保证不丢，对实时性要求低。
         """
         if not self._initialized:
             return
+
+        # 构造两套 QoS 配置
+        try:
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            qos_sensor = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+            qos_reliable = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=10,
+            )
+        except Exception as e:
+            logger.error("[ROS2] 构造 QoS 失败，回退到默认 depth=10: %s", e)
+            qos_sensor = 1
+            qos_reliable = 10
 
         # ── 3D 激光雷达点云（Livox Mid-360S → /livox/lidar）────────────────
         try:
             from sensor_msgs.msg import PointCloud2
             sub = self._node.create_subscription(
                 PointCloud2, ROS2_TOPIC_LIDAR3D,
-                lambda msg: self._dispatch("lidar3d", self._parse_pointcloud2(msg)), 10
+                lambda msg: self._dispatch("lidar3d", self._parse_pointcloud2(msg)), qos_sensor
             )
             self._subscribers["lidar3d"] = sub
-            logger.info("[ROS2] 已订阅 lidar3d → %s", ROS2_TOPIC_LIDAR3D)
+            logger.info("[ROS2] 已订阅 lidar3d → %s (BEST_EFFORT depth=1)", ROS2_TOPIC_LIDAR3D)
         except Exception as e:
             logger.error("[ROS2] 订阅 lidar3d 失败: %s", e)
 
@@ -146,10 +174,10 @@ class ROS2Bridge:
             from sensor_msgs.msg import Imu
             sub = self._node.create_subscription(
                 Imu, ROS2_TOPIC_IMU,
-                lambda msg: self._dispatch("imu", self._parse_imu(msg)), 10
+                lambda msg: self._dispatch("imu", self._parse_imu(msg)), qos_sensor
             )
             self._subscribers["imu"] = sub
-            logger.info("[ROS2] 已订阅 imu → %s", ROS2_TOPIC_IMU)
+            logger.info("[ROS2] 已订阅 imu → %s (BEST_EFFORT depth=1)", ROS2_TOPIC_IMU)
         except Exception as e:
             logger.error("[ROS2] 订阅 imu 失败: %s", e)
 
@@ -158,7 +186,7 @@ class ROS2Bridge:
             from nav_msgs.msg import OccupancyGrid
             sub = self._node.create_subscription(
                 OccupancyGrid, ROS2_TOPIC_MAP,
-                lambda msg: self._dispatch("map", self._parse_map(msg)), 10
+                lambda msg: self._dispatch("map", self._parse_map(msg)), qos_reliable
             )
             self._subscribers["map"] = sub
             logger.info("[ROS2] 已订阅 map → %s", ROS2_TOPIC_MAP)
@@ -170,7 +198,7 @@ class ROS2Bridge:
             from nav_msgs.msg import Odometry
             sub = self._node.create_subscription(
                 Odometry, ROS2_TOPIC_ODOM,
-                lambda msg: self._dispatch("odom", self._parse_odom(msg)), 10
+                lambda msg: self._dispatch("odom", self._parse_odom(msg)), qos_reliable
             )
             self._subscribers["odom"] = sub
             logger.info("[ROS2] 已订阅 odom → %s", ROS2_TOPIC_ODOM)
@@ -182,7 +210,7 @@ class ROS2Bridge:
             from sensor_msgs.msg import BatteryState
             sub = self._node.create_subscription(
                 BatteryState, ROS2_TOPIC_BATTERY,
-                lambda msg: self._dispatch("battery", self._parse_battery(msg)), 10
+                lambda msg: self._dispatch("battery", self._parse_battery(msg)), qos_reliable
             )
             self._subscribers["battery"] = sub
             logger.info("[ROS2] 已订阅 battery → %s", ROS2_TOPIC_BATTERY)
@@ -194,10 +222,10 @@ class ROS2Bridge:
             from sensor_msgs.msg import Image
             sub = self._node.create_subscription(
                 Image, ROS2_TOPIC_RGB_IMAGE,
-                lambda msg: self._dispatch("rgb_image", self._parse_image(msg, "rgb")), 10
+                lambda msg: self._dispatch("rgb_image", self._parse_image(msg, "rgb")), qos_sensor
             )
             self._subscribers["rgb_image"] = sub
-            logger.info("[ROS2] 已订阅 rgb_image → %s", ROS2_TOPIC_RGB_IMAGE)
+            logger.info("[ROS2] 已订阅 rgb_image → %s (BEST_EFFORT depth=1)", ROS2_TOPIC_RGB_IMAGE)
         except Exception as e:
             logger.error("[ROS2] 订阅 rgb_image 失败: %s", e)
 
@@ -206,10 +234,10 @@ class ROS2Bridge:
             from sensor_msgs.msg import Image
             sub = self._node.create_subscription(
                 Image, ROS2_TOPIC_DEPTH_IMAGE,
-                lambda msg: self._dispatch("depth_image", self._parse_image(msg, "depth")), 10
+                lambda msg: self._dispatch("depth_image", self._parse_image(msg, "depth")), qos_sensor
             )
             self._subscribers["depth_image"] = sub
-            logger.info("[ROS2] 已订阅 depth_image → %s", ROS2_TOPIC_DEPTH_IMAGE)
+            logger.info("[ROS2] 已订阅 depth_image → %s (BEST_EFFORT depth=1)", ROS2_TOPIC_DEPTH_IMAGE)
         except Exception as e:
             logger.error("[ROS2] 订阅 depth_image 失败: %s", e)
         # ── 带检测框的标注图像 ──────────────────────────────────────────────
@@ -217,10 +245,10 @@ class ROS2Bridge:
             from sensor_msgs.msg import Image
             sub = self._node.create_subscription(
                 Image, ROS2_TOPIC_ANNOTATED_IMAGE,
-                lambda msg: self._dispatch("annotated_image", self._parse_annotated_image(msg)), 10
+                lambda msg: self._dispatch("annotated_image", self._parse_annotated_image(msg)), qos_sensor
             )
             self._subscribers["annotated_image"] = sub
-            logger.info("[ROS2] 已订阅 annotated_image → %s", ROS2_TOPIC_ANNOTATED_IMAGE)
+            logger.info("[ROS2] 已订阅 annotated_image → %s (BEST_EFFORT depth=1)", ROS2_TOPIC_ANNOTATED_IMAGE)
         except Exception as e:
             logger.error("[ROS2] 订阅 annotated_image 失败: %s", e)
 
@@ -229,7 +257,7 @@ class ROS2Bridge:
             from std_msgs.msg import String
             sub = self._node.create_subscription(
                 String, ROS2_TOPIC_DETECTION_RESULTS,
-                lambda msg: self._dispatch("detection_results", self._parse_detection_results(msg)), 10
+                lambda msg: self._dispatch("detection_results", self._parse_detection_results(msg)), qos_reliable
             )
             self._subscribers["detection_results"] = sub
             logger.info("[ROS2] 已订阅 detection_results → %s", ROS2_TOPIC_DETECTION_RESULTS)
@@ -241,12 +269,36 @@ class ROS2Bridge:
             from nav_msgs.msg import Path
             sub = self._node.create_subscription(
                 Path, ROS2_TOPIC_PATH,
-                lambda msg: self._dispatch("path", self._parse_path(msg)), 10
+                lambda msg: self._dispatch("path", self._parse_path(msg)), qos_reliable
             )
             self._subscribers["path"] = sub
             logger.info("[ROS2] 已订阅 path → %s", ROS2_TOPIC_PATH)
         except Exception as e:
             logger.error("[ROS2] 订阅 path 失败: %s", e)
+
+        # ── VLM 场景描述（vlm_node → /vlm/scene_description）────────────────
+        try:
+            from std_msgs.msg import String
+            sub = self._node.create_subscription(
+                String, ROS2_TOPIC_VLM_DESCRIPTION,
+                lambda msg: self._dispatch("vlm_description", self._parse_vlm_description(msg)), qos_reliable
+            )
+            self._subscribers["vlm_description"] = sub
+            logger.info("[ROS2] 已订阅 vlm_description → %s", ROS2_TOPIC_VLM_DESCRIPTION)
+        except Exception as e:
+            logger.error("[ROS2] 订阅 vlm_description 失败: %s", e)
+
+        # ── VLM 状态（vlm_node → /vlm/status）────────────────────────────────
+        try:
+            from std_msgs.msg import String
+            sub = self._node.create_subscription(
+                String, ROS2_TOPIC_VLM_STATUS,
+                lambda msg: self._dispatch("vlm_status", self._parse_vlm_status(msg)), qos_reliable
+            )
+            self._subscribers["vlm_status"] = sub
+            logger.info("[ROS2] 已订阅 vlm_status → %s", ROS2_TOPIC_VLM_STATUS)
+        except Exception as e:
+            logger.error("[ROS2] 订阅 vlm_status 失败: %s", e)
 
         logger.info("[ROS2] 订阅者创建完成，成功: %s", list(self._subscribers.keys()))
 
@@ -319,9 +371,10 @@ class ROS2Bridge:
         raw = bytes(msg.data)
         total_points = msg.width * msg.height
 
-        # 降采样：最多保留 10000 个点发送给前端
-        # Livox Mid-360S 约 19968 点/帧，step≈2 → 保留约 50% 密度
-        MAX_POINTS = 10000
+        # 降采样：最多保留 LIDAR_MAX_PUSH_POINTS 个点发送给前端（默认 5000）
+        # Livox Mid-360S 约 19968 点/帧，step≈4 → 保留约 25% 密度
+        # 显著降低 WebSocket JSON 体积，避免阻塞前端主线程
+        MAX_POINTS = max(500, LIDAR_MAX_PUSH_POINTS)
         step = max(1, total_points // MAX_POINTS)
 
         points = []
@@ -636,6 +689,48 @@ class ROS2Bridge:
             "points": points,
         }
 
+    def _parse_vlm_description(self, msg) -> dict:
+        """
+        解析 /vlm/scene_description（std_msgs/String，JSON 格式）。
+        vlm_node 发布格式：
+          {
+            "timestamp": float,
+            "frame_id":  int,
+            "provider":  "qwen_vl",
+            "model":     "qwen-vl-plus",
+            "elapsed_ms": float,
+            "description": "前方 3 米处有一个穿红衣服的人...",
+            "per_object": [{"class_name", "distance_m", "text"}, ...],
+            "trigger":   "class_change" | "distance" | "heartbeat" | "force",
+            "tokens_in": int, "tokens_out": int
+          }
+        """
+        import json as _json
+        try:
+            return _json.loads(msg.data)
+        except Exception as e:
+            logger.error("[ROS2] 解析 vlm_description 失败: %s", e)
+            return {}
+
+    def _parse_vlm_status(self, msg) -> dict:
+        """
+        解析 /vlm/status（std_msgs/String，JSON 格式）。
+        vlm_node 发布格式：
+          {
+            "timestamp": float,
+            "state":     "idle" | "inferring" | "error",
+            "provider":  "qwen_vl",
+            "last_error": str | null,
+            "stats": {"requests": int, "errors": int, "avg_ms": float}
+          }
+        """
+        import json as _json
+        try:
+            return _json.loads(msg.data)
+        except Exception as e:
+            logger.error("[ROS2] 解析 vlm_status 失败: %s", e)
+            return {}
+
     # -------------------------------------------------------------------------
     # 控制指令发布
     # -------------------------------------------------------------------------
@@ -709,6 +804,85 @@ class ROS2Bridge:
             return {"success": True, "message": f"地图 '{map_path}' 加载成功"}
         except Exception as e:
             return {"success": False, "message": str(e)}
+
+    async def call_vlm_ask(self, prompt: str = "", timeout_sec: float = 15.0) -> dict:
+        """
+        手动触发 vlm_node 立即对当前画面 + 当前检测做一次 VLM 推理。
+        调用 std_srvs/Trigger service：/vlm/ask。
+        vlm_node 内部会把 prompt 暂存到下一次推理的 user_prompt 字段。
+
+        参数：
+          prompt - 自定义提问（如"描述这个房间的危险点"）；为空则用默认模板
+          timeout_sec - 等待 service 就绪 + 调用返回的总超时
+
+        返回：
+          {"success": bool, "message": str}
+        """
+        if not self._initialized:
+            return {"success": False, "message": "[模拟] ROS2 未启用，无法调用 /vlm/ask"}
+        try:
+            from std_srvs.srv import Trigger
+            # 通过节点参数把 prompt 透传给 vlm_node（service Trigger 无参数字段）
+            if prompt:
+                try:
+                    # 通过设置一个共享的 ROS2 参数（vlm_node 每次推理前读取此参数后清空）
+                    from rcl_interfaces.srv import SetParameters
+                    from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
+                    param_client = self._node.create_client(
+                        SetParameters, "/vlm_node/set_parameters"
+                    )
+                    if param_client.wait_for_service(timeout_sec=2.0):
+                        req = SetParameters.Request()
+                        p = Parameter()
+                        p.name = "next_user_prompt"
+                        p.value = ParameterValue(
+                            type=ParameterType.PARAMETER_STRING,
+                            string_value=prompt,
+                        )
+                        req.parameters = [p]
+                        future = param_client.call_async(req)
+                        # 非阻塞等待（spin 在独立线程进行）
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(
+                            None,
+                            lambda: self._wait_future(future, timeout_sec=3.0),
+                        )
+                    self._node.destroy_client(param_client)
+                except Exception as e:
+                    logger.warning("[ROS2] 设置 next_user_prompt 参数失败（继续调用 ask）: %s", e)
+
+            client = self._node.create_client(Trigger, ROS2_SERVICE_VLM_ASK)
+            try:
+                if not client.wait_for_service(timeout_sec=3.0):
+                    return {"success": False, "message": f"service {ROS2_SERVICE_VLM_ASK} 不可达"}
+                future = client.call_async(Trigger.Request())
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: self._wait_future(future, timeout_sec=timeout_sec),
+                )
+                if result is None:
+                    return {"success": False, "message": "service 调用超时"}
+                return {"success": bool(result.success), "message": str(result.message)}
+            finally:
+                self._node.destroy_client(client)
+        except Exception as e:
+            logger.error("[ROS2] 调用 /vlm/ask 失败: %s", e)
+            return {"success": False, "message": str(e)}
+
+    def _wait_future(self, future, timeout_sec: float = 10.0):
+        """阻塞等待 ROS2 future（spin 在 _executor 线程进行，不能在这里再 spin）"""
+        import time
+        deadline = time.time() + timeout_sec
+        while not future.done():
+            if time.time() > deadline:
+                return None
+            time.sleep(0.02)
+        try:
+            return future.result()
+        except Exception as e:
+            logger.error("[ROS2] future 结果获取失败: %s", e)
+            return None
 
     @property
     def is_enabled(self) -> bool:

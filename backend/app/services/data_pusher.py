@@ -46,12 +46,19 @@ async def push_robot_status():
 
 async def push_lidar():
     """推送 3D 激光雷达点云数据（Livox Mid-360S → /livox/lidar）
-    优先使用真实 ROS2 PointCloud2 数据，不可用时降级为 3D 模拟数据
+
+    优化：若没有任何客户端订阅 lidar topic，则跳过本帧（不生成 mock，
+          也不访问 ROS2 缓存），完全把 CPU 让给视频/检测等正在被观看的 topic。
     """
     _last_source = None   # 上一次数据源，用于检测切换
     _log_counter = 0      # 每 50 次打一次诊断日志（约 5 秒）
     while True:
         try:
+            # 没人订阅时直接 short-circuit
+            if not ws_manager.has_subscribers("lidar"):
+                await asyncio.sleep(PUSH_RATE_LIDAR)
+                continue
+
             # 优先使用 ROS2 桥接的真实 3D 点云数据
             data = None
             source = "mock"
@@ -152,7 +159,15 @@ async def push_odom():
 
 
 async def push_slam_map():
-    await _push_loop("slam_map", PUSH_RATE_SLAM_MAP, mock_generator.get_slam_map)
+    """SLAM 地图：地图数据量大，没人看时跳过生成"""
+    while True:
+        try:
+            if ws_manager.has_subscribers("slam_map"):
+                data = mock_generator.get_slam_map()
+                await ws_manager.broadcast("slam_map", data)
+        except Exception as e:
+            logger.error("[PUSH] topic=slam_map 推送失败: %s", e)
+        await asyncio.sleep(PUSH_RATE_SLAM_MAP)
 
 
 async def push_log():
@@ -209,76 +224,87 @@ async def push_video():
 
     while True:
         try:
+            # 三个视频 topic 任一被订阅时才推送，否则整轮跳过节省 CPU
+            want_rgb   = ws_manager.has_subscribers("video_rgb")
+            want_anno  = ws_manager.has_subscribers("video_annotated")
+            want_depth = ws_manager.has_subscribers("video_depth")
+            if not (want_rgb or want_anno or want_depth):
+                await asyncio.sleep(PUSH_RATE_VIDEO)
+                continue
+
             frame_count += 1
             t = frame_count % 256
             now = time.time()
 
             # ── RGB 原图帧（无标注，始终推送纯原始图像）──────────────────────
             rgb_source = "mock"
-            rgb_data = ros2_bridge.get_latest("rgb_image") if ros2_bridge.is_enabled else None
-            if rgb_data and rgb_data.get("data"):
-                rgb_source = "ros2"
-                await ws_manager.broadcast("video_rgb", {
-                    "type": "rgb",
-                    "width":     rgb_data.get("width", 640),
-                    "height":    rgb_data.get("height", 480),
-                    "data":      rgb_data["data"],
-                    "encoding":  rgb_data.get("encoding", "jpeg/base64"),
-                    "timestamp": rgb_data.get("timestamp", now),
-                    "frame_id":  frame_count,
-                    "source":    "realsense_d435i",
-                })
-            else:
-                await ws_manager.broadcast("video_rgb", {
-                    "type": "rgb",
-                    "width": 160, "height": 120,
-                    "data": _make_fallback_png(160, 120, t, 100, 200 - t),
-                    "encoding": "png/base64",
-                    "timestamp": now,
-                    "frame_id": frame_count,
-                    "source": "mock",
-                })
+            if want_rgb:
+                rgb_data = ros2_bridge.get_latest("rgb_image") if ros2_bridge.is_enabled else None
+                if rgb_data and rgb_data.get("data"):
+                    rgb_source = "ros2"
+                    await ws_manager.broadcast("video_rgb", {
+                        "type": "rgb",
+                        "width":     rgb_data.get("width", 640),
+                        "height":    rgb_data.get("height", 480),
+                        "data":      rgb_data["data"],
+                        "encoding":  rgb_data.get("encoding", "jpeg/base64"),
+                        "timestamp": rgb_data.get("timestamp", now),
+                        "frame_id":  frame_count,
+                        "source":    "realsense_d435i",
+                    })
+                else:
+                    await ws_manager.broadcast("video_rgb", {
+                        "type": "rgb",
+                        "width": 160, "height": 120,
+                        "data": _make_fallback_png(160, 120, t, 100, 200 - t),
+                        "encoding": "png/base64",
+                        "timestamp": now,
+                        "frame_id": frame_count,
+                        "source": "mock",
+                    })
 
             # ── AI 标注图像帧（带检测框，仅检测节点运行时推送）────────────────
-            annotated = ros2_bridge.get_latest("annotated_image") if ros2_bridge.is_enabled else None
-            if annotated and annotated.get("data"):
-                await ws_manager.broadcast("video_annotated", {
-                    "type": "annotated",
-                    "width":     annotated.get("width", 640),
-                    "height":    annotated.get("height", 480),
-                    "data":      annotated["data"],
-                    "encoding":  annotated.get("encoding", "jpeg/base64"),
-                    "timestamp": annotated.get("timestamp", now),
-                    "frame_id":  frame_count,
-                    "source":    "realsense_d435i",
-                })
+            if want_anno:
+                annotated = ros2_bridge.get_latest("annotated_image") if ros2_bridge.is_enabled else None
+                if annotated and annotated.get("data"):
+                    await ws_manager.broadcast("video_annotated", {
+                        "type": "annotated",
+                        "width":     annotated.get("width", 640),
+                        "height":    annotated.get("height", 480),
+                        "data":      annotated["data"],
+                        "encoding":  annotated.get("encoding", "jpeg/base64"),
+                        "timestamp": annotated.get("timestamp", now),
+                        "frame_id":  frame_count,
+                        "source":    "realsense_d435i",
+                    })
 
             # ── Depth 帧 ──────────────────────────────────────────────────────
-            depth_data = None
-            if ros2_bridge.is_enabled:
-                depth_data = ros2_bridge.get_latest("depth_image")
+            if want_depth:
+                depth_data = None
+                if ros2_bridge.is_enabled:
+                    depth_data = ros2_bridge.get_latest("depth_image")
 
-            if depth_data and depth_data.get("data"):
-                await ws_manager.broadcast("video_depth", {
-                    "type": "depth",
-                    "width":    depth_data.get("width", 640),
-                    "height":   depth_data.get("height", 480),
-                    "data":     depth_data["data"],
-                    "encoding": depth_data.get("encoding", "jpeg/base64"),
-                    "timestamp": depth_data.get("timestamp", now),
-                    "frame_id": frame_count,
-                    "source":   "realsense_d435i",
-                })
-            else:
-                await ws_manager.broadcast("video_depth", {
-                    "type": "depth",
-                    "width": 160, "height": 120,
-                    "data": _make_fallback_png(160, 120, 0, t, 255 - t),
-                    "encoding": "png/base64",
-                    "timestamp": now,
-                    "frame_id": frame_count,
-                    "source": "mock",
-                })
+                if depth_data and depth_data.get("data"):
+                    await ws_manager.broadcast("video_depth", {
+                        "type": "depth",
+                        "width":    depth_data.get("width", 640),
+                        "height":   depth_data.get("height", 480),
+                        "data":     depth_data["data"],
+                        "encoding": depth_data.get("encoding", "jpeg/base64"),
+                        "timestamp": depth_data.get("timestamp", now),
+                        "frame_id": frame_count,
+                        "source":   "realsense_d435i",
+                    })
+                else:
+                    await ws_manager.broadcast("video_depth", {
+                        "type": "depth",
+                        "width": 160, "height": 120,
+                        "data": _make_fallback_png(160, 120, 0, t, 255 - t),
+                        "encoding": "png/base64",
+                        "timestamp": now,
+                        "frame_id": frame_count,
+                        "source": "mock",
+                    })
 
             # ── 诊断日志（数据源切换时 + 每 100 帧打一次）────────────────────
             _log_counter += 1
@@ -318,6 +344,47 @@ async def push_detection_results():
         await asyncio.sleep(0.1)   # 10Hz，与标注图像帧率解耦
 
 
+async def push_vlm_description():
+    """
+    推送 VLM 场景描述（/vlm/scene_description → vlm_description topic）。
+
+    vlm_node 在关键帧触发时才发布（节流：默认 3 秒冷却 + 类别/距离变化触发），
+    backend 仅在收到新 timestamp 时转发一次给前端，避免重复推送。
+    无真实数据时静默等待。
+    """
+    _last_ts = 0.0
+    while True:
+        try:
+            if ros2_bridge.is_enabled:
+                data = ros2_bridge.get_latest("vlm_description")
+                ts = float(data.get("timestamp", 0.0)) if data else 0.0
+                if data and ts > _last_ts:
+                    _last_ts = ts
+                    await ws_manager.broadcast("vlm_description", data)
+        except Exception as e:
+            logger.error("[PUSH] topic=vlm_description 推送失败: %s", e)
+        await asyncio.sleep(0.5)   # 2Hz 轮询：VLM 触发频率本身就低
+
+
+async def push_vlm_status():
+    """
+    推送 VLM 节点状态（/vlm/status → vlm_status topic）。
+    心跳级别，1Hz 即可。
+    """
+    _last_ts = 0.0
+    while True:
+        try:
+            if ros2_bridge.is_enabled:
+                data = ros2_bridge.get_latest("vlm_status")
+                ts = float(data.get("timestamp", 0.0)) if data else 0.0
+                if data and ts > _last_ts:
+                    _last_ts = ts
+                    await ws_manager.broadcast("vlm_status", data)
+        except Exception as e:
+            logger.error("[PUSH] topic=vlm_status 推送失败: %s", e)
+        await asyncio.sleep(1.0)
+
+
 async def start_all_push_tasks():
     """启动所有后台推送任务"""
     tasks = [
@@ -330,6 +397,8 @@ async def start_all_push_tasks():
         asyncio.create_task(push_log(), name="push_log"),
         asyncio.create_task(push_video(), name="push_video"),            # 真实相机 + 降级模拟
         asyncio.create_task(push_detection_results(), name="push_det"),  # YOLO 检测结果
+        asyncio.create_task(push_vlm_description(), name="push_vlm"),    # VLM 场景描述
+        asyncio.create_task(push_vlm_status(), name="push_vlm_status"),  # VLM 节点状态
     ]
     logger.info("[PUSH] 所有数据推送任务已启动，共 %d 个", len(tasks))
     return tasks

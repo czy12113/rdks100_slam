@@ -15,6 +15,21 @@ export type WsTopicHandler = (data: unknown) => void
 
 export type WsStatus = 'connecting' | 'connected' | 'disconnected' | 'error'
 
+/**
+ * 后端默认就会推送的轻量 topic（与 backend WebSocketManager.DEFAULT_TOPICS 对齐）。
+ * 这些 topic 不需要前端额外 subscribe，连上 /ws 就会收到。
+ * 其余 topic（lidar / video_* / slam_map / detection_results 等）属于重型 topic，
+ * 必须由页面在 wsClient.on() 时显式 subscribe、卸载时 unsubscribe。
+ */
+const AUTO_SUBSCRIBED_TOPICS = new Set<string>([
+  'system',
+  'robot_status',
+  'heartbeat',
+  'log',
+  'odom',
+  'vlm_status',   // VLM 节点心跳，前端任何页面都可观测
+])
+
 class WebSocketClient {
   private ws: WebSocket | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -25,6 +40,8 @@ class WebSocketClient {
 
   // topic -> handlers[]
   private handlers: Map<string, WsTopicHandler[]> = new Map()
+  // 已经向后端 subscribe 的重型 topic（用于断线重连时重发 subscribe）
+  private subscribedTopics: Set<string> = new Set()
 
   connect() {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return
@@ -51,22 +68,38 @@ class WebSocketClient {
     this._setStatus('disconnected')
   }
 
-  /** 订阅指定 topic 的消息 */
+  /**
+   * 订阅指定 topic 的消息。
+   * 对于重型 topic（不在 AUTO_SUBSCRIBED_TOPICS 中），第一次注册 handler 时
+   * 自动向后端发送 subscribe；最后一个 handler 卸载时自动 unsubscribe。
+   * 这样 VideoView 卸载后后端就不会再生成视频帧 JSON，反之亦然。
+   */
   on(topic: string, handler: WsTopicHandler): () => void {
     if (!this.handlers.has(topic)) {
       this.handlers.set(topic, [])
     }
-    this.handlers.get(topic)!.push(handler)
-    // 返回取消订阅函数
+    const list = this.handlers.get(topic)!
+    const wasEmpty = list.length === 0
+    list.push(handler)
+
+    if (wasEmpty && !AUTO_SUBSCRIBED_TOPICS.has(topic)) {
+      this.subscribedTopics.add(topic)
+      this.subscribe(topic)
+    }
     return () => this.off(topic, handler)
   }
 
   /** 取消订阅 */
   off(topic: string, handler: WsTopicHandler) {
     const list = this.handlers.get(topic)
-    if (list) {
-      const idx = list.indexOf(handler)
-      if (idx !== -1) list.splice(idx, 1)
+    if (!list) return
+    const idx = list.indexOf(handler)
+    if (idx !== -1) list.splice(idx, 1)
+
+    // 重型 topic 在没有 handler 时主动通知后端停止推送
+    if (list.length === 0 && !AUTO_SUBSCRIBED_TOPICS.has(topic)) {
+      this.subscribedTopics.delete(topic)
+      this.unsubscribe(topic)
     }
   }
 
@@ -145,6 +178,10 @@ class WebSocketClient {
     this._setStatus('connected')
     this.reconnectDelay = WS_RECONNECT_DELAY_MS
     this._startHeartbeat()
+    // 断线重连后：把当前页面已经监听的重型 topic 重新 subscribe 给后端
+    for (const topic of this.subscribedTopics) {
+      this.subscribe(topic)
+    }
   }
 
   private _onMessage(event: MessageEvent) {

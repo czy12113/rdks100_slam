@@ -48,6 +48,9 @@ class TJCHMIBridge(Node):
         self.declare_parameter('angular_step', 0.15)    # 角速度递增步长
         self.declare_parameter('linear_deadzone', 0.02) # 线速度死区
         self.declare_parameter('angular_deadzone', 0.05)# 角速度死区
+        # v11.1 防锁死：HMI 递增按键 N 秒内无新按下 → 自动归零并发零速
+        # 0 或负数 = 关闭（保持旧的"按一次走到底直到停止/急停"行为）
+        self.declare_parameter('auto_zero_timeout_sec', 3.0)
         
         port = self.get_parameter('port').value
         baudrate = self.get_parameter('baudrate').value
@@ -59,10 +62,15 @@ class TJCHMIBridge(Node):
         self.angular_step = self.get_parameter('angular_step').value
         self.linear_deadzone = self.get_parameter('linear_deadzone').value
         self.angular_deadzone = self.get_parameter('angular_deadzone').value
+        self.auto_zero_timeout_sec = float(
+            self.get_parameter('auto_zero_timeout_sec').value)
         
         # 当前速度状态（递增控制）
         self.current_linear = 0.0
         self.current_angular = 0.0
+        # v11.1 防锁死：最近一次按键时间戳（time.monotonic）
+        # publish_current_velocity 中按需刷新；auto_zero_check 周期性比对
+        self.last_button_press_ts = 0.0
         
         # 初始化串口
         try:
@@ -120,7 +128,42 @@ class TJCHMIBridge(Node):
         self.update_timer = self.create_timer(
             1.0 / update_rate, self.update_screen_callback)
         
+        # v11.1 防锁死：自动归零检查定时器（0.5Hz 足以）
+        # 仅当 auto_zero_timeout_sec > 0 时启用
+        if self.auto_zero_timeout_sec > 0:
+            self.auto_zero_timer = self.create_timer(
+                0.5, self.auto_zero_check)
+            self.get_logger().info(
+                f'已启用 HMI 按键自动归零保护：{self.auto_zero_timeout_sec}s 无新按键 → 自动停车')
+        else:
+            self.auto_zero_timer = None
+        
         self.get_logger().info('TJC串口屏桥接节点已启动')
+    
+    def auto_zero_check(self):
+        """
+        v11.1 防锁死兜底：
+        HMI 递增按键模式下，按一次"前进"current_linear 就一直保持非零，
+        sendLoop 会持续发非零 Twist，遇到通信抖动/按钮失联时小车会走到撞墙。
+        本回调每 0.5s 检查一次，若当前速度非零且距上次按键超过
+        auto_zero_timeout_sec，强制清零并发布零速。
+        """
+        if self.current_linear == 0.0 and self.current_angular == 0.0:
+            return
+        if self.last_button_press_ts <= 0.0:
+            return
+        elapsed = time.monotonic() - self.last_button_press_ts
+        if elapsed < self.auto_zero_timeout_sec:
+            return
+        self.get_logger().warn(
+            f'[自动归零] {elapsed:.1f}s 无新按键，强制停车 '
+            f'(原速度 linear={self.current_linear:.2f}, angular={self.current_angular:.2f})')
+        self.current_linear = 0.0
+        self.current_angular = 0.0
+        msg = Twist()
+        msg.linear.x = 0.0
+        msg.angular.z = 0.0
+        self.cmd_vel_pub.publish(msg)
     
     def init_screen(self):
         """初始化屏幕，跳转到主页面"""
@@ -414,6 +457,11 @@ class TJCHMIBridge(Node):
         
         # 主页面 (page 0)
         if page_id == 0:
+            # v11.1：运动相关按键统一刷新"最近按键时间戳"，
+            # 供 auto_zero_check 判断是否需要自动归零
+            if component_id in (12, 13, 15, 17):
+                self.last_button_press_ts = time.monotonic()
+
             if component_id == 12:  # 前进按钮 - 递增前进速度
                 self.current_linear = min(
                     self.current_linear + self.linear_step,
@@ -449,12 +497,14 @@ class TJCHMIBridge(Node):
             elif component_id == 16:  # 停止按钮 - 清零所有速度
                 self.current_linear = 0.0
                 self.current_angular = 0.0
+                self.last_button_press_ts = 0.0  # 主动停止 → 清零超时戳
                 self.publish_current_velocity()
                 self.get_logger().info('[停止] 所有速度已清零')
                 
             elif component_id == 14:  # 急停按钮 - 立即停止
                 self.current_linear = 0.0
                 self.current_angular = 0.0
+                self.last_button_press_ts = 0.0  # 急停 → 清零超时戳
                 self.emergency_stop()
                 
             elif component_id == 7:  # 切换到导航页面

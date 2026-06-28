@@ -290,7 +290,7 @@ def generate_launch_description():
         #   3. 然后再恢复这里的 remap=('cmd_vel','cmd_vel_safe')
         parameters=[{
             'port': stm32_port,
-            'baudrate': stm32_baudrate,
+            'baudrate': ParameterValue(stm32_baudrate, value_type=int),
             # 导航模式必须打开 TF：AMCL 提供 map→odom，STM32 提供 odom→base_link
             'publish_tf': True,
             # ★ v4 抑制超调：让 bridge 启动门槛与 MPPI 减速带宽匹配

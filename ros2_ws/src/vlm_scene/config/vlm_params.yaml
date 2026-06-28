@@ -1,0 +1,53 @@
+# =============================================================================
+# vlm_scene 节点参数（vlm_node.py）
+# =============================================================================
+# 修改本文件并重启节点即可生效。也可在 launch 文件用 parameters=[...] 覆盖。
+# 命令行覆盖示例：
+#   ros2 run vlm_scene vlm_node --ros-args -p provider:=mock -p cooldown_sec:=5.0
+# =============================================================================
+
+/**:
+  ros__parameters:
+
+    # ── Provider 选择 ─────────────────────────────────────────────────────────
+    # 可选：
+    #   qwen_vl         阿里通义千问 VL（推荐，DashScope OpenAI 兼容）
+    #   openai_vision   任意 OpenAI 兼容 + Vision 端点（智谱 GLM-4V / Moonshot / 自建 vLLM）
+    #   deepseek_text   DeepSeek 纯文本（看不到画面，只根据检测结果生成描述）
+    #   internvl_local  本地 InternVL2-2B（板端 BPU，目前为占位）
+    #   mock            离线模板，零成本验证管线
+    provider: "qwen_vl"
+
+    # 模型名，留空则用 provider 默认（qwen-vl-plus / gpt-4o-mini / deepseek-chat...）
+    model: ""
+
+    # ── 订阅 / 发布 ───────────────────────────────────────────────────────────
+    sub_topic_rgb:       "/camera/camera/color/image_raw"
+    sub_topic_detection: "/detection/results"
+    pub_topic_description: "/vlm/scene_description"
+    pub_topic_status:      "/vlm/status"
+
+    # ── 触发节流 ──────────────────────────────────────────────────────────────
+    # 相邻两次推理最小间隔（秒）。VLM 调用是付费 + 慢，必须节流。
+    cooldown_sec: 3.0
+    # 没有任何变化时多久强制刷一次，保证前端面板内容不停。设大一点可以省钱。
+    heartbeat_sec: 20.0
+    # 任意类别最近距离变化超过这个阈值时也触发
+    distance_threshold_m: 0.5
+    # 由远变近且越过此阈值时强制触发（典型避障告警）
+    near_distance_m: 1.0
+
+    # ── 输入预处理 ────────────────────────────────────────────────────────────
+    # 喂给 VLM 的最大边长度（像素），过大浪费 token，过小 VLM 看不清
+    max_image_side: 768
+    # 至少有 N 个检测框才触发（0 = 即使空场景也调用）
+    min_detections: 1
+    # 单次最多传给 VLM 的检测框数（避免 prompt 过长）
+    max_detections: 10
+
+    # ── Prompt ────────────────────────────────────────────────────────────────
+    # 留空则使用 provider 内置中文 system prompt
+    system_prompt: ""
+
+    # ── 网络 ──────────────────────────────────────────────────────────────────
+    timeout_sec: 20.0
