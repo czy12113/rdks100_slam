@@ -293,6 +293,29 @@ def generate_launch_description():
             'baudrate': ParameterValue(stm32_baudrate, value_type=int),
             # 导航模式必须打开 TF：AMCL 提供 map→odom，STM32 提供 odom→base_link
             'publish_tf': True,
+            # ★ v6.9 强制开环 odom（修复 AMCL "图标钉死 + 激光跟车飘"）
+            # ────────────────────────────────────────────────────────
+            # 现场实测 STM32 端 #define ODOMETRY_READ_ENCODER = 0 时，
+            # 固件仍在以 10Hz 发上行 odom 帧，但帧里 pos_x/pos_y/yaw 字段
+            # 恒为 0（因为没编码器读数）。
+            #
+            # 默认 odom_source='auto' 的逻辑是：STM32 还在按时上行就让位、
+            # 让 _parse_odom_data 接管发布。结果：
+            #   - /odom 一直发零位姿
+            #   - odom→base_link TF 锁死在 (0,0,0)
+            #   - AMCL 触发更新需要 odom 位姿增量 → 永远不更新
+            #   - map→odom TF 锁死在初始 2D Pose Estimate 值
+            #   - 现象：RViz 车图标钉死、激光点云随车物理运动飘
+            #
+            # 改 'open_loop' 后，bridge 无视 STM32 的零位姿帧，
+            # 用最近一次写入串口的 last_tx_v / last_tx_w 做差分积分，
+            # 20Hz 发出连续可用的 /odom + TF，AMCL 才能持续更新。
+            #
+            # ※ v7.0 闭环 odom 方案现场验证失败 (小车速度仍被锁死), 已回滚.
+            #   保留 'open_loop' 是当前稳定方案. 后续若再启动闭环, 需要先
+            #   把 I2C 改成分段状态机 (方案 B), 才能彻底消除编码器读对
+            #   控制帧的阻塞.
+            'odom_source': 'open_loop',
             # ★ v4 抑制超调：让 bridge 启动门槛与 MPPI 减速带宽匹配
             # 见上方 DeclareLaunchArgument 注释。运行时可覆盖：
             #   ros2 launch ... stm32_min_motion_linear:=0.08

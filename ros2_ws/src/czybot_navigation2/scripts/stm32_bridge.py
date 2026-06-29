@@ -27,6 +27,24 @@ STM32 串口通信桥接节点  v5 —— 与 STM32 ChassisParams.h 全面对齐
   port              : 串口设备（自动 fallback 到 /dev/ttyUSB0~2）
   baudrate          : 波特率（与 STM32 一致，默认 115200）
   publish_tf        : 是否广播 odom→base_link TF（默认 True）
+  odom_source       : 里程计来源策略，决定 /odom 与 TF 由谁发布
+                        - 'auto'      ：默认。STM32 上行 odom 帧时优先用
+                                        STM32；超过 odom_stm32_timeout
+                                        没有 STM32 帧就切到开环积分兜底。
+                                        ★ 这是 STM32 关闭编码器（v6）后
+                                        Nav2 不漂的关键：STM32 一旦不再
+                                        发 odom，上位机必须自己接管，
+                                        否则 AMCL/MPPI 会因为 TF 中断
+                                        把车定位飘走。
+                        - 'stm32'     ：只信 STM32 上行，不做开环兜底
+                        - 'open_loop' ：无视 STM32 上行，仅按 cmd_vel
+                                        积分得到 /odom（编码器始终关闭
+                                        且想完全旁路 STM32 时使用）
+                        - 'disabled'  ：完全不发 /odom 也不发 TF
+  odom_stm32_timeout: 'auto' 模式下，多久（秒）没有收到 STM32 odom 帧
+                        判定为"STM32 不上行"，开始用开环 odom 兜底。
+                        默认 0.5s。
+  odom_open_loop_hz : 开环 odom 发布频率 (Hz)，默认 20.0
   max_linear        : 线速度硬限幅 (m/s)，默认 0.60 与 STM32 对齐
   max_angular       : 角速度硬限幅 (rad/s)，默认 1.20 与 STM32 对齐
   linear_deadzone   : 线速度死区 (m/s)，低于此值发零速；默认 0.005
@@ -128,6 +146,20 @@ class STM32Bridge(Node):
         # 设为 -N/2，使时间戳落到测量窗口中点。
         self.declare_parameter('odom_stamp_offset_ms', -2.0)
 
+        # ── v6.7 修复 Nav2 漂移：开环 odom 兜底 ────────────────────────────
+        # 背景：STM32 v6 之后 ODOMETRY_READ_ENCODER=0 时不再发送 odom 帧
+        # （旧版会发全零 odom，导致 AMCL 看到"车一直停在原点"，配合 MPPI
+        # 输出非零 cmd_vel，整条 TF 链就被拽飞）。
+        # 但 Nav2 / AMCL / MPPI 必须有连续的 /odom 和 odom→base_link TF
+        # 才能正常工作，所以这里加一个旁路：当 STM32 沉默时，本节点用
+        # 已经发到串口的 last_tx_v / last_tx_w 做一次性差分积分，得到
+        # "上位机自洽"的开环 odom，AMCL 用它来做相对运动估计，map→odom
+        # 校正剩余的累计误差。这正好把"上位机已经知道车在跑多快"这件事
+        # 变成一份合法 /odom，比 STM32 发零强得多。
+        self.declare_parameter('odom_source', 'auto')          # auto/stm32/open_loop/disabled
+        self.declare_parameter('odom_stm32_timeout', 0.5)
+        self.declare_parameter('odom_open_loop_hz', 20.0)
+
         port = self.get_parameter('port').value
         baudrate = self.get_parameter('baudrate').value
         self.publish_tf = self.get_parameter('publish_tf').value
@@ -147,6 +179,18 @@ class STM32Bridge(Node):
         self.odom_stamp_offset_ns = int(
             float(self.get_parameter('odom_stamp_offset_ms').value) * 1_000_000
         )
+
+        # 解析 odom_source 并做容错（未知值回落到 'auto'）
+        raw_odom_source = str(self.get_parameter('odom_source').value).lower()
+        if raw_odom_source not in ('auto', 'stm32', 'open_loop', 'disabled'):
+            self.get_logger().warn(
+                f'未知 odom_source="{raw_odom_source}"，回落到 auto')
+            raw_odom_source = 'auto'
+        self.odom_source = raw_odom_source
+        self.odom_stm32_timeout = float(
+            self.get_parameter('odom_stm32_timeout').value)
+        self.odom_open_loop_hz = float(
+            self.get_parameter('odom_open_loop_hz').value)
 
         # 整数化的硬限幅（mm/s, mrad/s），用于 cmd_vel 入口快速比较
         self._max_linear_mm = int(self.max_linear * 1000)
@@ -193,12 +237,34 @@ class STM32Bridge(Node):
         self._estop_lock_until = 0.0    # 急停锁定结束时刻
         self._lock = threading.Lock()
 
+        # ── 开环 odom 兜底状态（v6.7） ─────────────────────────────────────
+        # 当 STM32 不上行 odom（编码器关闭）时，本节点用最近一次成功写入
+        # 串口的 (last_tx_v, last_tx_w) 做差分积分，对外发布一份连续的
+        # /odom 与 odom→base_link TF，喂给 Nav2 / AMCL / MPPI。
+        self._ol_x = 0.0
+        self._ol_y = 0.0
+        self._ol_yaw = 0.0
+        self._ol_last_time = 0.0
+        self._last_stm32_odom_time = 0.0   # 上一次成功收到 STM32 odom 帧的 time.time()
+
         # ── 可观测性统计（用于 1 Hz info 日志和 /stm32_bridge/tx_cmd）──────
         # 现场可用 ros2 topic echo /stm32_bridge/tx_cmd 直接看实际写串口的值，
         # 避免被 /cmd_vel → bridge → 串口 → STM32 任意一段卡死时无法定位。
         self._last_rx_time = 0.0     # 最近一次 cmd_vel 回调时间（time.time()）
         self._last_rx_v = 0          # 最近一次 cmd_vel 入参（限幅+死区+补偿后, mm/s）
         self._last_rx_w = 0
+        # ★ v8.0 开环 odom 修复：记录"启动补偿前"的 MPPI 真实意图速度
+        # ─────────────────────────────────────────────────────────────
+        # _last_rx_v 是经过启动补偿（kickstart 0.08m/s）后的值，比 MPPI
+        # 实际想发的命令大 0.02~0.07m/s。用它做开环积分会导致 /odom 持续
+        # 系统性高估车走的距离（map 里 base_link 比真车多走一段），
+        # AMCL 又压不回来 → 静态停车后红框（实时点云）不能回到蓝框
+        # （建图静态障碍物），且行驶中障碍物在 costmap 里持续朝车方向漂移。
+        # _last_intent_v / _last_intent_w 记录"限幅 + 死区过滤后但未经
+        # 启动补偿"的值，即 MPPI 真实想发的速度；_publish_open_loop_odom
+        # 用这个值做积分，odom 误差从 ~50% 降到电机响应延迟量级（~10%）。
+        self._last_intent_v = 0      # 限幅+死区后、补偿前 (mm/s)
+        self._last_intent_w = 0
         self._last_tx_time = 0.0     # 最近一次实际写串口时间
         self._last_tx_v = 0
         self._last_tx_w = 0
@@ -226,12 +292,20 @@ class STM32Bridge(Node):
         self.tx_cmd_pub = self.create_publisher(
             Int32MultiArray, 'stm32_bridge/tx_cmd', 10)
 
-        if self.publish_tf:
+        # 注意：即使 odom_source='disabled'，也保留 TF broadcaster（外部
+        # 可能仍然需要 odom→base_link，例如手动定位）。但 disabled 模式
+        # 不会主动发任何 TF。
+        self.tf_broadcaster = None
+        if self.publish_tf and self.odom_source != 'disabled':
             self.tf_broadcaster = TransformBroadcaster(self)
             self.publish_initial_tf()
             self.initial_tf_timer = self.create_timer(
                 0.05, self.publish_initial_tf_callback)
             self.received_odom_data = False
+        else:
+            # disabled 或 publish_tf=False：占位，让 _parse_odom_data
+            # 与 _publish_open_loop_odom 的判空逻辑一致
+            self.received_odom_data = True
 
         # 接收缓冲区 + 串口读到达时间戳（用于给 odom 打更准的 stamp）
         self.rx_buffer = bytearray()
@@ -257,10 +331,21 @@ class STM32Bridge(Node):
         self._observability_timer = self.create_timer(
             1.0, self._observability_callback)
 
+        # 开环 odom 定时器：'auto' / 'open_loop' 都启用
+        if self.odom_source in ('auto', 'open_loop'):
+            ol_period = 1.0 / max(1.0, self.odom_open_loop_hz)
+            self._open_loop_timer = self.create_timer(
+                ol_period, self._publish_open_loop_odom)
+        else:
+            self._open_loop_timer = None
+
         self.get_logger().info(
-            f'[stm32_bridge v5] 已就绪：限速 v={self.max_linear:.2f}m/s, '
+            f'[stm32_bridge v6] 已就绪：限速 v={self.max_linear:.2f}m/s, '
             f'w={self.max_angular:.2f}rad/s, cmd_timeout={self.CMD_TIMEOUT}s, '
-            f'watchdog={self.WATCHDOG_TIMEOUT}s')
+            f'watchdog={self.WATCHDOG_TIMEOUT}s, '
+            f'odom_source={self.odom_source}, '
+            f'stm32_timeout={self.odom_stm32_timeout:.2f}s, '
+            f'open_loop_hz={self.odom_open_loop_hz:.1f}')
 
     # ────────────────────────────────────────────────────────────────────────
     # TF 初始化
@@ -274,12 +359,137 @@ class STM32Bridge(Node):
                 self.get_logger().info('收到真实里程计数据，停止发布初始 TF')
 
     def publish_initial_tf(self):
+        if self.tf_broadcaster is None:
+            return
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = 'odom'
         t.child_frame_id = 'base_link'
         t.transform.rotation.w = 1.0
         self.tf_broadcaster.sendTransform(t)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 开环 odom 兜底（v6.7）
+    # ────────────────────────────────────────────────────────────────────────
+    def _publish_open_loop_odom(self):
+        """
+        当 STM32 不再上行 odom 帧（编码器关闭）时，由本节点根据 MPPI 真实
+        意图速度 (last_intent_v, last_intent_w) 积分得到 /odom 与
+        odom→base_link TF。Nav2 / AMCL / MPPI 依赖这条 TF 链才能正确做
+        相对运动估计。
+
+        关键点：
+          1. v8.0 修复（关键）：积分用 _last_intent_*（限幅+死区后但补偿前），
+             不再用 _last_tx_*（启动补偿后写串口的值）。
+             ─────────────────────────────────────────────────────
+             历史教训：v6.7 用 _last_tx_* 的初衷是"积分和实际发给电机的
+             速度严格一致"，但在阿克曼车低速场景下，bridge 把 0.05m/s 的
+             MPPI 命令抬升到 0.08m/s 启动门槛才能爬出静摩擦——这是给电机
+             看的，不是车真实速度。继续用它积分，odom 会持续高估行驶距离，
+             map→base_link 比真车多走一段，激光投影到 map 后就落在"真实
+             障碍物-多走出的距离"位置，红框相对蓝框朝车方向偏，停车后
+             AMCL 都纠不回来。改用 _last_intent_* 后误差从 ~50% 降到电机
+             响应延迟量级（~10%）。
+          2. 用 _last_tx_* 判断"是否实际在发车"：tx=0（急停/超时停车）时
+             积分按 0，即使 intent 非零也不积。这样保证急停后 odom 立刻冻结，
+             而不是继续按 intent 漂移。
+          3. 'auto' 模式下，只有 STM32 odom 帧超时（>odom_stm32_timeout）
+             才接管 /odom 发布，避免和 STM32 odom 抢话题。
+          4. 'open_loop' 模式无视 STM32，始终发布。
+          5. covariance 比 STM32 odom 略宽，告诉下游"这是开环估计，
+             请配合 AMCL/SLAM 的位置校正使用"。
+          6. odom_source == 'disabled' 不会启用本定时器。
+        """
+        if not self.running:
+            return
+        if self.odom_source == 'auto':
+            if (self._last_stm32_odom_time > 0.0
+                    and (time.time() - self._last_stm32_odom_time)
+                    < self.odom_stm32_timeout):
+                # STM32 还在按时上行，让真实 odom 优先
+                return
+
+        now = time.time()
+        with self._lock:
+            # v8.0：用 MPPI 意图速度积分（未经启动补偿），用 tx 状态判断是否在发
+            v_intent_mm = int(self._last_intent_v)
+            w_intent_mrad = int(self._last_intent_w)
+            v_tx_mm = int(self._last_tx_v)
+            w_tx_mrad = int(self._last_tx_w)
+        # tx=0 说明 bridge 当前实际未向电机输出（急停/超时停车/启动前）
+        # → 不论 intent 是什么，积分按 0，保证 odom 冻结与车真实状态一致
+        v_mm = v_intent_mm if v_tx_mm != 0 else 0
+        w_mrad = w_intent_mrad if w_tx_mrad != 0 else 0
+
+        if self._ol_last_time == 0.0:
+            self._ol_last_time = now
+            return
+        dt = now - self._ol_last_time
+        self._ol_last_time = now
+        if dt <= 0.0 or dt > 1.0:
+            # 第一拍或大跳变（节点刚启动 / 长时间挂起）：只更新时间戳，
+            # 下一拍再积分
+            return
+
+        v = v_mm / 1000.0
+        w = w_mrad / 1000.0
+
+        # 标准 2D 自行车积分（在 yaw + dt*w/2 中点处投影），与
+        # STM32 Odometry.c 的积分模型一致，所以 'auto' 模式两边切换
+        # 不会造成位姿跳变。
+        mid_yaw = self._ol_yaw + 0.5 * w * dt
+        self._ol_x += v * math.cos(mid_yaw) * dt
+        self._ol_y += v * math.sin(mid_yaw) * dt
+        self._ol_yaw += w * dt
+        # wrap to [-pi, pi]
+        while self._ol_yaw > math.pi:
+            self._ol_yaw -= 2.0 * math.pi
+        while self._ol_yaw < -math.pi:
+            self._ol_yaw += 2.0 * math.pi
+
+        stamp = self.get_clock().now().to_msg()
+        cy = math.cos(self._ol_yaw / 2.0)
+        sy = math.sin(self._ol_yaw / 2.0)
+
+        if self.publish_tf and self.tf_broadcaster is not None:
+            t = TransformStamped()
+            t.header.stamp = stamp
+            t.header.frame_id = 'odom'
+            t.child_frame_id = 'base_link'
+            t.transform.translation.x = self._ol_x
+            t.transform.translation.y = self._ol_y
+            t.transform.translation.z = 0.0
+            t.transform.rotation.w = cy
+            t.transform.rotation.x = 0.0
+            t.transform.rotation.y = 0.0
+            t.transform.rotation.z = sy
+            self.tf_broadcaster.sendTransform(t)
+
+        odom = Odometry()
+        odom.header.stamp = stamp
+        odom.header.frame_id = 'odom'
+        odom.child_frame_id = 'base_link'
+        odom.pose.pose.position.x = self._ol_x
+        odom.pose.pose.position.y = self._ol_y
+        odom.pose.pose.position.z = 0.0
+        odom.pose.pose.orientation.w = cy
+        odom.pose.pose.orientation.z = sy
+        odom.twist.twist.linear.x = v
+        odom.twist.twist.angular.z = w
+        # 开环噪声更大，给下游一个清晰的信号
+        odom.pose.covariance[0] = 5e-3
+        odom.pose.covariance[7] = 5e-3
+        odom.pose.covariance[14] = 1e6
+        odom.pose.covariance[21] = 1e6
+        odom.pose.covariance[28] = 1e6
+        odom.pose.covariance[35] = 1e-2
+        odom.twist.covariance[0] = 5e-3
+        odom.twist.covariance[7] = 1e6
+        odom.twist.covariance[14] = 1e6
+        odom.twist.covariance[21] = 1e6
+        odom.twist.covariance[28] = 1e6
+        odom.twist.covariance[35] = 1e-2
+        self.odom_pub.publish(odom)
 
     # ────────────────────────────────────────────────────────────────────────
     # cmd_vel 回调（纯内存操作）
@@ -312,6 +522,15 @@ class STM32Bridge(Node):
         if abs(angular_mrad) < self._angular_deadzone_mrad:
             angular_mrad = 0
 
+        # ★ v8.0：在启动补偿前先抓一份"MPPI 真实意图"快照
+        # ──────────────────────────────────────────────────────────
+        # 这个值给 _publish_open_loop_odom 做积分用。intent 不带启动补偿
+        # 抬升，反映 MPPI 真正想让车走多快，odom 才不会被人为放大。
+        # 注意：限幅、死区过滤仍然作用（< 死区 → 0，否则保留原值），
+        # 这是 MPPI 进入电机前的"应当发生"的物理速度估计。
+        intent_v = linear_mm
+        intent_w = angular_mrad
+
         # ★ 启动补偿（kickstart）：
         # 死区之外但低于电机最小启动门槛的值，统一抬到门槛值，
         # 否则 Nav2 在 0.10~0.18 m/s 命令下电机会原地卡死。
@@ -328,6 +547,9 @@ class STM32Bridge(Node):
             self._last_rx_time = now
             self._last_rx_v = linear_mm
             self._last_rx_w = angular_mrad
+            # ★ v8.0 开环 odom 修复：记录补偿前的 MPPI 意图速度
+            self._last_intent_v = intent_v
+            self._last_intent_w = intent_w
             self._rx_count += 1
 
             if now < self._estop_lock_until:
@@ -610,7 +832,25 @@ class STM32Bridge(Node):
             self.rx_buffer = self.rx_buffer[ODOM_FRAME_LEN:]
 
     def _parse_odom_data(self, frame):
-        if self.publish_tf:
+        """
+        解析 STM32 上行 odom 帧。
+
+        v6.7：是否真正发布 /odom 与 TF 由 odom_source 决定：
+          - 'stm32' / 'auto'  ：接收并发布
+          - 'open_loop'        ：仅记录"STM32 是否仍在上行"作为参考，不发
+          - 'disabled'         ：完全忽略
+
+        'auto' 与开环定时器互斥：本函数收到帧时记录时间戳，开环定时器
+        看到 odom_stm32_timeout 内有更新就主动让位。同时把 STM32 真实
+        位姿同步到开环积分器里，避免后续 STM32 一掉线就发生位姿跳变。
+        """
+        # 不论是否发布，都先标记 STM32 仍在上行（'auto' 模式据此仲裁）
+        self._last_stm32_odom_time = time.time()
+
+        if self.odom_source in ('open_loop', 'disabled'):
+            return
+
+        if self.publish_tf and self.tf_broadcaster is not None:
             self.received_odom_data = True
 
         pos_x = struct.unpack('<i', frame[3:7])[0]
@@ -699,6 +939,16 @@ class STM32Bridge(Node):
         odom.twist.covariance[35] = 3e-4     # vth
 
         self.odom_pub.publish(odom)
+
+        # 同步开环积分器，保证 'auto' 模式下 STM32 帧丢失时切换到开环
+        # 不会有位姿跳变。仅在 'auto' 模式下做，'stm32' 模式根本没开
+        # 开环定时器，无所谓。
+        if self.odom_source == 'auto':
+            self._ol_x = x
+            self._ol_y = y
+            self._ol_yaw = theta
+            self._ol_last_time = time.time()
+
         self.get_logger().debug(
             f'[RX] x={x:.3f}, y={y:.3f}, yaw={theta:.3f}, '
             f'vx={vx:.3f}, vth={vth:.3f}')

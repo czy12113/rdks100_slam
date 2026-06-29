@@ -245,6 +245,11 @@ const cmdWz = ref(0)
 const displayCmdUntil = ref(0)
 let displayCmdTimer: ReturnType<typeof setTimeout> | null = null
 
+// v11.2: 当 STM32 端 ODOMETRY_READ_ENCODER=0 时底盘反馈速度恒为 0，
+// 用一段较长的兜底窗口在 odom 速度为 0 但近期下发过非零命令时显示命令值。
+const STALE_VELOCITY_FALLBACK_MS = 1500
+const lastNonZeroCmdAt = ref(0)
+
 const odomOffsetX   = ref(0)
 const odomOffsetY   = ref(0)
 const odomOffsetYaw = ref(0)
@@ -328,13 +333,23 @@ let unsubOdom: (() => void) | null = null
 // ── 计算属性 ──────────────────────────────────────────────────────────
 const DISPLAY_CMD_HOLD_MS = 300
 const isDisplayingCommandVelocity = computed(() => displayCmdUntil.value > Date.now())
+// 兜底：odom 速度 ≈ 0 且最近 STALE_VELOCITY_FALLBACK_MS 内下发过非零命令时，
+// 用命令值代替反馈值显示。一旦 odom 出现非零反馈立刻让位给真实数据。
+function shouldFallbackToCmd(odomVal: number): boolean {
+  if (Math.abs(odomVal) > 1e-3) return false
+  return Date.now() - lastNonZeroCmdAt.value < STALE_VELOCITY_FALLBACK_MS
+}
 const displayVx = computed(() => {
   if (isDisplayingCommandVelocity.value) return cmdVx.value
-  return robotStore.currentVelocity.linear_x
+  const v = robotStore.currentVelocity.linear_x
+  if (shouldFallbackToCmd(v)) return cmdVx.value
+  return v
 })
 const displayWz = computed(() => {
   if (isDisplayingCommandVelocity.value) return cmdWz.value
-  return robotStore.currentVelocity.angular_z
+  const w = robotStore.currentVelocity.angular_z
+  if (shouldFallbackToCmd(w)) return cmdWz.value
+  return w
 })
 const displayPose = computed(() => {
   const p = robotStore.currentPose
@@ -357,6 +372,11 @@ function updateCommandDisplay(vx: number, wz: number) {
   cmdVx.value = vx
   cmdWz.value = wz
   displayCmdUntil.value = Date.now() + DISPLAY_CMD_HOLD_MS
+
+  // 记录最近一次"实际下发"的非零命令时间，给 STALE_VELOCITY_FALLBACK_MS 兜底窗口提供基准
+  if (Math.abs(vx) > 1e-3 || Math.abs(wz) > 1e-3) {
+    lastNonZeroCmdAt.value = Date.now()
+  }
 
   if (displayCmdTimer) clearTimeout(displayCmdTimer)
   displayCmdTimer = setTimeout(() => {
