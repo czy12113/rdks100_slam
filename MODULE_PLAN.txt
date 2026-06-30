@@ -2,7 +2,7 @@
   RDK S100 智能机器人上位机系统 — 模块化迭代演进方案
 ================================================================================
 
-版本: 12.0（归档版）  |  日期: 2026-06-29  |  当前状态: VLM 场景理解已接入 + 视频监控页展示 + Nav2 实车导航链路仍需继续现场调参
+版本: 13.0（归档版）  |  日期: 2026-06-30  |  当前状态: 火/烟 YOLOv5 一阶检测 + Qwen-VL 二次确认 + 前端全局火警告警闭环已接入；Nav2 实车导航链路仍需继续现场调参
 
 ─────────────────────────────────────────────────────────────────────────────
 版本记录
@@ -553,6 +553,69 @@ v12.0 (2026-06-29) — VLM 视觉语言场景理解接入（Qwen-VL + ROS2 + Web
     - 如果后续需要语音播报，可订阅 /vlm/scene_description 接 TTS。
     - 换模型/provider 时改 vlm_params.yaml 的 provider，或改 keys.py 的 VLM_QWEN_MODEL。
 
+v13.0 (2026-06-30) — 火灾/烟雾识别情景接入（YOLOv5 一阶筛查 + Qwen-VL 二次确认 + 全局前端告警）
+
+  · 本版定位：
+    - 在 v12.0 VLM 场景理解能力基础上，新增比赛场景中的“火灾/烟雾识别与告警”闭环。
+    - 当前目标是完成端到端火警链路归档：D435i RGB → fire_smoke_node CPU YOLOv5 连续命中去抖 → /fire_smoke/prealert → vlm_node Qwen-VL 二次确认 → /alert/fire → 后端 WebSocket fire_alert → 前端全局 Overlay。
+    - 本版本把当前已完成内容归档为 v13.0，并新增 FIRE_SMOKE_GUIDE.md 作为现场联调手册。
+
+  · ROS2 火警链路：
+    - ros2_ws/src/d435i_detection/d435i_detection/fire_smoke_node.py：新增火/烟二分类检测节点，订阅 D435i RGB 与对齐深度，CPU YOLOv5 推理，连续 3 次命中后发布预警。
+    - ros2_ws/src/d435i_detection/config/fire_smoke_params.yaml：新增火/烟检测配置，包含 weights_path、yolov5_src_dir、confidence_threshold、consecutive_hits、infer_width/height、pub_topic_* 等参数。
+    - ros2_ws/src/d435i_detection/launch/fire_smoke.launch.py：新增火/烟检测启动文件，节点名为 /fire_smoke_detection_node。
+    - 输出 /fire_smoke/results、/fire_smoke/annotated_image、/fire_smoke/prealert，其中 /fire_smoke/prealert 只在连续命中后触发，避免 YOLO 单帧误报直接打扰前端。
+
+  · fire-smoke-detect 开源仓库整理（本次补充归档）：
+    - 本地目录已从 rdks100_slam/fire-smoke-detect-yolov4/ 重命名为 rdks100_slam/fire-smoke-detect-yolov5/，名称与实际使用的 YOLOv5 源码一致。
+    - 已清理与当前 CPU YOLOv5 火/烟检测无关的旧目录/文件：yolov4/、result/、crawl/、readmes/、xml_lab/、.git/、latest_darknet_API.py、LICENSE、README.md、.gitignore、yolov5/tutorial.ipynb、yolov5/inference/。
+    - yolov5_src_dir 统一指向 /home/sunrise/rdks100_slam/fire-smoke-detect-yolov5/yolov5；部署到 RDK 后按 /home/sunrise/... 路径生效。
+    - 已同步 4 个路径引用文件：fire_smoke_node.py、fire_smoke.launch.py、fire_smoke_params.yaml、FIRE_SMOKE_GUIDE.md。
+    - 操作指南里的权重复制命令已改为从 fire-smoke-detect-yolov5/yolov5/best.pt 复制到 d435i_detection/weights/fire_smoke_best.pt。
+    - 全工程 grep 已确认无 fire-smoke-detect-yolov4 残留。
+
+  · VLM 二次确认：
+    - ros2_ws/src/vlm_scene/config/vlm_params.yaml 增加火警段参数：sub_topic_fire_prealert="/fire_smoke/prealert"、pub_topic_fire_alert="/alert/fire"、fire_alert_enabled、fire_alert_cooldown_sec、fire_alert_force、fire_alert_include_image。
+    - ros2_ws/src/vlm_scene/vlm_scene/vlm_node.py 在保留原 /vlm/scene_description 能力的同时，订阅 /fire_smoke/prealert，对疑似火/烟画面调用 Qwen-VL 进行严格 JSON 二次确认。
+    - /alert/fire 输出结构化结果：level、fire_detected、smoke_detected、confidence、reason、recommendation、prealert、image_b64、provider、model、elapsed_ms。
+    - level=high 进入高危前端告警；level=low 作为疑似提醒；level=none 不触发弹窗。
+
+  · 后端接入：
+    - backend/app/core/config.py 新增 ROS2_TOPIC_FIRE_ALERT="/alert/fire"、ROS2_TOPIC_FIRE_PREALERT="/fire_smoke/prealert"、ROS2_TOPIC_FIRE_RESULTS="/fire_smoke/results"。
+    - backend/app/services/ros2_bridge.py 新增 fire_alert 订阅与 _parse_fire_alert()，并保留 fire_prealert 解析用于 debug / 调参。
+    - backend/app/services/data_pusher.py 新增 push_fire_alert()，把 /alert/fire 最新结果推送到 WebSocket topic "fire_alert"。
+    - backend/app/core/websocket_manager.py 新增 fire_alert topic，并加入 DEFAULT_TOPICS；火警属于安全关键消息，任意页面连接 /ws 都默认能收到。
+
+  · 前端 Stage 4（本次会话新增/修改）：
+    - frontend/src/composables/useFireAlert.ts：模块级单例 state，加载时立即 wsClient.on("fire_alert")，跨页面共享且任一组件卸载不会断流；内置 history、dismiss、clearAll、hasUnreadHigh、audioEnabled。
+    - useFireAlert.ts 内置 Web Audio 警报音合成：high=4 声 880Hz，low=2 声 520Hz；unlockAudio() 在用户首次 pointerdown 或 keydown 时激活 AudioContext，规避浏览器自动播放限制。
+    - frontend/src/components/FireAlertOverlay.vue：三层 UI，level=high 顶部红色脉冲横幅，level=low 右下角黄色 toast，ElDialog 展示画面截图、置信度、火焰/烟雾判定、判定依据、处置建议。
+    - frontend/src/App.vue：把 <FireAlertOverlay /> 挂到根节点，保证任意页面都能收到和展示告警。
+    - frontend/src/api/websocket.ts：fire_alert 加入 AUTO_SUBSCRIBED_TOPICS，与后端 DEFAULT_TOPICS 对齐，不需要页面显式 subscribe。
+
+  · 前端关键设计点：
+    - 高危自动弹窗，低危不阻塞：watch(visibleLatest) 仅对新 frame_id 的 level=high 弹一次 Dialog；level=low 只走右下角 toast。
+    - Dismiss 按 frame_id 去重：点击“我已知晓”或“忽略”后，同一 frame_id 不再弹；新 frame_id 到来仍正常告警。
+    - WS 单例绑定：composable 模块加载时立即订阅 fire_alert，避免路由切换或组件卸载导致安全消息断流。
+
+  · 文档 Stage 5（本次会话新增）：
+    - FIRE_SMOKE_GUIDE.md：新增火灾/烟雾检测小白上手指南，覆盖架构图、启动顺序（终端 A~E）、联调测试步骤、误报漏报调参表、常见报错对照表、关键文件速查和一键关停说明。
+
+  · 完整链路：
+      D435i RGB
+        → fire_smoke_node（CPU YOLOv5，连续 3 次命中触发）
+        → /fire_smoke/prealert
+        → vlm_node（Qwen-VL 二次确认，严格 JSON）
+        → /alert/fire
+        → backend ros2_bridge + data_pusher
+        → WebSocket topic "fire_alert"
+        → useFireAlert composable
+        → FireAlertOverlay（横幅 + toast + 弹窗 + 警报音）
+
+  · 当前现场验证标准：
+    - 按 FIRE_SMOKE_GUIDE.md 第 2 节启动终端 A~E，再按第 3 节用手机播放火焰视频对准 D435i。
+    - 25 秒内应看到：终端 C 输出 [FIRE] 预警发出 hits=3；终端 D 输出 [FIRE] 二次确认结果 level=high；终端 E 输出 [PUSH] fire_alert level=high；浏览器出现顶部红色脉冲横幅、详情弹窗和 4 声警报音。
+
 
 ─────────────────────────────────────────────────────────────────────────────
 
@@ -560,7 +623,7 @@ v12.0 (2026-06-29) — VLM 视觉语言场景理解接入（Qwen-VL + ROS2 + Web
 零、当前真实状态
 ================================================================================
 
-  已具备 (v12.0):
+  已具备 (v13.0):
     - FastAPI + Vue3 Web 上位机框架（可运行，局域网浏览器可访问）
     - 8 个可视化页面（监控/视频/激光/IMU/控制/SLAM/导航/设备），VLM 场景理解嵌入视频监控页
     - 模拟数据生成器（mock_data.py），仿真了全部传感器数据
@@ -580,6 +643,13 @@ v12.0 (2026-06-29) — VLM 视觉语言场景理解接入（Qwen-VL + ROS2 + Web
     - ✅ vlm_scene ROS2 包：vlm_node、关键帧节流、provider 插件、/vlm/scene_description、/vlm/status、/vlm/ask
     - ✅ 后端 VLM 接入：config.py topic/service 配置、ros2_bridge 订阅与 service client、data_pusher 推送、/api/vlm 路由
     - ✅ 前端 VLM 接入：VideoView.vue 场景理解面板、状态 tag、立即分析、手动 prompt、历史记录
+    - ✅ 火灾/烟雾告警闭环（v13.0）：fire_smoke_node → /fire_smoke/prealert → vlm_node → /alert/fire → WebSocket fire_alert → FireAlertOverlay
+    - ✅ 火/烟一阶检测：CPU YOLOv5 火/烟二分类，连续命中去抖，发布 /fire_smoke/results、/fire_smoke/annotated_image、/fire_smoke/prealert
+    - ✅ fire-smoke-detect 仓库整理：目录更名为 fire-smoke-detect-yolov5，清理 YOLOv4/爬虫/旧结果等无关内容，yolov5_src_dir 路径引用全量同步
+    - ✅ 火警二次确认：Qwen-VL 严格 JSON 输出 level/reason/recommendation，支持 fire_alert_cooldown_sec 和 image_b64 附图
+    - ✅ 后端火警接入：config.py fire topic 配置、ros2_bridge 订阅 /alert/fire、data_pusher.push_fire_alert()、websocket_manager fire_alert 默认订阅
+    - ✅ 前端全局火警 UI：useFireAlert 单例、FireAlertOverlay 顶部横幅/右下角 toast/详情弹窗/Web Audio 警报音、App.vue 根挂载
+    - ✅ 火警联调文档：FIRE_SMOKE_GUIDE.md 覆盖启动顺序、测试步骤、报错表、调参表、关键文件和一键关停
     - ✅ 视频推送三级降级（ros2_annotated → ros2 → mock），annotated_image 优先 WebSocket 推送
     - ✅ YOLO 检测修复：NMS 后处理 + 变量名拼写修正
     - ✅ BPU 检测节点（detection_node_bpu.py）：hbm_runtime 推理 + 变量名冲突修复
@@ -990,19 +1060,27 @@ v12.0 (2026-06-29) — VLM 视觉语言场景理解接入（Qwen-VL + ROS2 + Web
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ M14  告警与通知                                                                │
+│ M14  告警与通知（火警专项已完成 v13.0；通用规则引擎待扩展）                      │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ 优先级: ★★★★  难度: ★★  依赖: M08-HW                                           │
+│ 优先级: ★★★★  难度: ★★  依赖: M08-HW, M04-HW, M10-VLM  | 状态: ◐ 部分完成       │
 │                                                                             │
-│ 说明: 统一告警规则引擎（CPU>80%、电量<20%、激光检测到近距离障碍等）              │
+│ 已完成(v13.0): 火灾/烟雾专项告警链路，YOLOv5 一阶检测 + Qwen-VL 二次确认，      │
+│               通过 WebSocket fire_alert 在任意前端页面触发全局 Overlay。        │
 │                                                                             │
-│ 后端新增:                                                                     │
+│ 待扩展: 统一告警规则引擎（CPU>80%、电量<20%、激光检测到近距离障碍等）            │
+│                                                                             │
+│ 已完成后端/前端:                                                              │
+│   config.py / ros2_bridge.py / data_pusher.py / websocket_manager.py          │
+│   useFireAlert.ts / FireAlertOverlay.vue / App.vue / websocket.ts             │
+│                                                                             │
+│ 后续后端新增:                                                                 │
 │   services/alert_engine.py       — 规则评估 + 告警去重 + 级别管理               │
 │   api/alert.py                   — 规则 CRUD + 告警历史                        │
 │                                                                             │
-│ 前端: 顶部告警铃铛 + 下拉列表 + 声音提示（浏览器 Notification API）             │
+│ 后续前端: 顶部告警铃铛 + 下拉列表 + 浏览器 Notification API                     │
 │                                                                             │
-│ 验证标准: 遮挡激光雷达 -> 页面弹警告 -> 取消遮挡 -> 警告自动恢复                  │
+│ 当前验证标准: 手机播放火焰视频对准 D435i -> 25 秒内前端红色横幅/弹窗/警报音      │
+│ 后续验证标准: 遮挡激光雷达 -> 页面弹警告 -> 取消遮挡 -> 警告自动恢复             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────┐

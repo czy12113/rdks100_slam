@@ -385,6 +385,35 @@ async def push_vlm_status():
         await asyncio.sleep(1.0)
 
 
+async def push_fire_alert():
+    """
+    推送火警告警（/alert/fire → fire_alert topic）。
+
+    vlm_node 完成二次确认后才会发布，频率非常低（默认 15s 冷却），
+    backend 仅在 timestamp 推进时转发一次，前端据此弹窗 / 横幅 / 播放报警音。
+    无论是否真火警都转发（level=none 表示二次确认认定为误报，前端可选择忽略）。
+    """
+    _last_ts = 0.0
+    while True:
+        try:
+            if ros2_bridge.is_enabled:
+                data = ros2_bridge.get_latest("fire_alert")
+                ts = float(data.get("timestamp", 0.0)) if data else 0.0
+                if data and ts > _last_ts:
+                    _last_ts = ts
+                    await ws_manager.broadcast("fire_alert", data)
+                    logger.warning(
+                        "[PUSH] fire_alert 已转发 level=%s fire=%s smoke=%s conf=%.2f",
+                        data.get("level"), data.get("fire_detected"),
+                        data.get("smoke_detected"),
+                        float(data.get("confidence", 0.0) or 0.0),
+                    )
+        except Exception as e:
+            logger.error("[PUSH] topic=fire_alert 推送失败: %s", e)
+        # 0.5s 轮询，火警告警发出频率本来就低，不会浪费 CPU
+        await asyncio.sleep(0.5)
+
+
 async def start_all_push_tasks():
     """启动所有后台推送任务"""
     tasks = [
@@ -399,6 +428,7 @@ async def start_all_push_tasks():
         asyncio.create_task(push_detection_results(), name="push_det"),  # YOLO 检测结果
         asyncio.create_task(push_vlm_description(), name="push_vlm"),    # VLM 场景描述
         asyncio.create_task(push_vlm_status(), name="push_vlm_status"),  # VLM 节点状态
+        asyncio.create_task(push_fire_alert(), name="push_fire_alert"),  # 火警二次确认结果
     ]
     logger.info("[PUSH] 所有数据推送任务已启动，共 %d 个", len(tasks))
     return tasks

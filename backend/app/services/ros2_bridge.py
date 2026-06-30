@@ -17,6 +17,7 @@ from app.core.config import (
     ROS2_TOPIC_ODOM, ROS2_TOPIC_PATH, ROS2_TOPIC_GOAL,
     ROS2_TOPIC_SLAM_POSE,
     ROS2_TOPIC_VLM_DESCRIPTION, ROS2_TOPIC_VLM_STATUS, ROS2_SERVICE_VLM_ASK,
+    ROS2_TOPIC_FIRE_ALERT, ROS2_TOPIC_FIRE_PREALERT,
     ROS2_SERVICE_SAVE_MAP, ROS2_SERVICE_LOAD_MAP,
     ROS2_SERVICE_START_SLAM, ROS2_SERVICE_STOP_SLAM,
     ROBOT_MAX_LINEAR_VEL, ROBOT_MAX_ANGULAR_VEL,
@@ -299,6 +300,30 @@ class ROS2Bridge:
             logger.info("[ROS2] 已订阅 vlm_status → %s", ROS2_TOPIC_VLM_STATUS)
         except Exception as e:
             logger.error("[ROS2] 订阅 vlm_status 失败: %s", e)
+
+        # ── 火警告警（vlm_node → /alert/fire）─────────────────────────────────
+        try:
+            from std_msgs.msg import String
+            sub = self._node.create_subscription(
+                String, ROS2_TOPIC_FIRE_ALERT,
+                lambda msg: self._dispatch("fire_alert", self._parse_fire_alert(msg)), qos_reliable
+            )
+            self._subscribers["fire_alert"] = sub
+            logger.info("[ROS2] 已订阅 fire_alert → %s", ROS2_TOPIC_FIRE_ALERT)
+        except Exception as e:
+            logger.error("[ROS2] 订阅 fire_alert 失败: %s", e)
+
+        # ── 火警预警（fire_smoke_node → /fire_smoke/prealert，debug 用）────
+        try:
+            from std_msgs.msg import String
+            sub = self._node.create_subscription(
+                String, ROS2_TOPIC_FIRE_PREALERT,
+                lambda msg: self._dispatch("fire_prealert", self._parse_fire_prealert(msg)), qos_reliable
+            )
+            self._subscribers["fire_prealert"] = sub
+            logger.info("[ROS2] 已订阅 fire_prealert → %s", ROS2_TOPIC_FIRE_PREALERT)
+        except Exception as e:
+            logger.error("[ROS2] 订阅 fire_prealert 失败: %s", e)
 
         logger.info("[ROS2] 订阅者创建完成，成功: %s", list(self._subscribers.keys()))
 
@@ -710,6 +735,48 @@ class ROS2Bridge:
             return _json.loads(msg.data)
         except Exception as e:
             logger.error("[ROS2] 解析 vlm_description 失败: %s", e)
+            return {}
+
+    def _parse_fire_alert(self, msg) -> dict:
+        """
+        解析 /alert/fire（std_msgs/String，JSON 格式，vlm_node 二次确认后发布）。
+
+        vlm_node 发布格式：
+          {
+            "timestamp":      float,
+            "frame_id":       int,
+            "level":          "none" | "low" | "high",
+            "fire_detected":  bool,
+            "smoke_detected": bool,
+            "confidence":     0~1,
+            "reason":         "中文判定依据",
+            "recommendation": "中文建议",
+            "raw":            原始 VLM 文本,
+            "provider":       "qwen_vl",
+            "model":          "qwen-vl-plus",
+            "elapsed_ms":     float,
+            "prealert":       {...},          # 一阶检测器原始预警
+            "image_b64":      "JPEG base64"   # 可选，附带画面
+          }
+        直接 JSON.loads 后透传给前端。
+        """
+        import json as _json
+        try:
+            return _json.loads(msg.data)
+        except Exception as e:
+            logger.error("[ROS2] 解析 fire_alert 失败: %s", e)
+            return {}
+
+    def _parse_fire_prealert(self, msg) -> dict:
+        """
+        解析 /fire_smoke/prealert（std_msgs/String，JSON 格式）。
+        fire_smoke_node 在 N 次连续命中后才发一次，主要给 debug / 调参用。
+        """
+        import json as _json
+        try:
+            return _json.loads(msg.data)
+        except Exception as e:
+            logger.error("[ROS2] 解析 fire_prealert 失败: %s", e)
             return {}
 
     def _parse_vlm_status(self, msg) -> dict:

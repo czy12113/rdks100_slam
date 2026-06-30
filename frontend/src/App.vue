@@ -1,5 +1,7 @@
 <template>
   <router-view />
+  <!-- 全局火警告警层：横幅 + 弹窗 + 报警音，所有页面共享 -->
+  <FireAlertOverlay />
 </template>
 
 <script setup lang="ts">
@@ -7,6 +9,7 @@ import { onMounted, onUnmounted } from 'vue'
 import { useRobotStore } from '@/stores/robot'
 import { wsClient } from '@/api/websocket'
 import { controlApi } from '@/api/http'
+import FireAlertOverlay from '@/components/FireAlertOverlay.vue'
 
 const robotStore = useRobotStore()
 

@@ -27,14 +27,17 @@ ROS2 Service（可选，用于前端手动触发）：
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -50,6 +53,33 @@ except Exception:
 from .providers import create_provider, list_providers, VLMRequest
 from .providers.base import Detection
 from .utils import KeyframeSelector, ros_image_to_bgr, downsample_keep_aspect
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 火警二次确认默认 Prompt
+# 让 VLM 严格输出 JSON，便于后端 / 前端结构化消费
+# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_FIRE_PROMPT = (
+    "你正在协助一台移动机器人做火灾安全监测。\n"
+    "一阶检测器（YOLOv5）刚刚在画面里报告了疑似 fire 或 smoke，"
+    "但它的误报率较高，常见误报有：橙红色衣物 / 灯光 / 夕阳 / 水蒸气 / 雾 / 电焊 / 屏幕反光等。\n\n"
+    "请仔细观察图像，判断**画面里是否真的存在明火或浓烟**，"
+    "并以严格 JSON 输出（不要加任何额外文字，不要 markdown 代码块）：\n"
+    "{\n"
+    '  "level":          "none" | "low" | "high",\n'
+    '  "fire_detected":  true | false,\n'
+    '  "smoke_detected": true | false,\n'
+    '  "confidence":     0~1 之间的小数,\n'
+    '  "reason":         "中文一句话，说明判定依据（看到了什么 / 排除了哪些误报）",\n'
+    '  "recommendation": "中文一句话，对人员的建议（撤离 / 检查 / 无需处理）"\n'
+    "}\n\n"
+    "判断标准：\n"
+    "  level=high：能明确看到明火（火焰）或大量浓烟，需要立即处理\n"
+    "  level=low：有可疑亮光 / 雾气，但难以确定，建议人工核查\n"
+    "  level=none：明显是误报（例如灯具 / 衣物 / 反光）\n"
+)
+# 火警 system_prompt：短小精悍，让 VLM 进入"安全判断"模式
+FIRE_SYSTEM_PROMPT = "你是一台具备视觉理解能力的安全监测助手，专注于判定火灾隐患。"
 
 
 class VLMSceneNode(Node):
@@ -83,6 +113,23 @@ class VLMSceneNode(Node):
         # 网络
         self.declare_parameter("timeout_sec",          20.0)
 
+        # ── 火警二次确认 ────────────────────────────────────────────────────
+        # 订阅 fire_smoke_node 发的 /fire_smoke/prealert
+        self.declare_parameter("sub_topic_fire_prealert", "/fire_smoke/prealert")
+        # 火警 VLM 推理结果发布到这个 topic（结构化 JSON，前端弹窗用）
+        self.declare_parameter("pub_topic_fire_alert",    "/alert/fire")
+        # 启用火警二次确认（false 时收到 prealert 也不会调 VLM）
+        self.declare_parameter("fire_alert_enabled",      True)
+        # 火警 prompt（留空则用 DEFAULT_FIRE_PROMPT）
+        self.declare_parameter("fire_alert_prompt",       "")
+        # 火警冷却：触发一次告警后 X 秒内忽略新的 prealert，避免刷屏 / 省 token
+        self.declare_parameter("fire_alert_cooldown_sec", 15.0)
+        # 收到 prealert 后，是否绕过普通触发器节流强制立即推理
+        self.declare_parameter("fire_alert_force",        True)
+        # 火警告警附带的画面是否 base64 嵌入 /alert/fire 的 JSON 中
+        # （前端无需再拉一次图，但消息体会变大约 50KB；后端 WS 也得放行）
+        self.declare_parameter("fire_alert_include_image", True)
+
         self.provider_name      = self.get_parameter("provider").value
         self.model_name         = self.get_parameter("model").value
         self._sub_rgb_topic     = self.get_parameter("sub_topic_rgb").value
@@ -98,6 +145,16 @@ class VLMSceneNode(Node):
         self._max_dets          = int(self.get_parameter("max_detections").value)
         self._system_prompt     = self.get_parameter("system_prompt").value or None
         self._timeout           = float(self.get_parameter("timeout_sec").value)
+
+        # 火警相关
+        self._sub_fire_topic    = self.get_parameter("sub_topic_fire_prealert").value
+        self._pub_fire_topic    = self.get_parameter("pub_topic_fire_alert").value
+        self._fire_enabled      = bool(self.get_parameter("fire_alert_enabled").value)
+        self._fire_prompt       = (self.get_parameter("fire_alert_prompt").value
+                                    or DEFAULT_FIRE_PROMPT)
+        self._fire_cooldown     = float(self.get_parameter("fire_alert_cooldown_sec").value)
+        self._fire_force        = bool(self.get_parameter("fire_alert_force").value)
+        self._fire_with_image   = bool(self.get_parameter("fire_alert_include_image").value)
 
         # ------------------------------------------------------------------
         # 实例化 Provider
@@ -138,6 +195,13 @@ class VLMSceneNode(Node):
         self._force_lock = threading.Lock()
         self._force_pending: Optional[str] = None  # None = 不强制；str = 用户 prompt
 
+        # ── 火警二次确认状态 ────────────────────────────────────────────────
+        # _fire_pending: 收到 /fire_smoke/prealert 时记录 payload；推理线程消费后置 None
+        # _last_fire_alert_ts: 上一次成功发出 /alert/fire 的时刻（冷却用）
+        self._fire_lock = threading.Lock()
+        self._fire_pending: Optional[dict] = None
+        self._last_fire_alert_ts: float = 0.0
+
         # ------------------------------------------------------------------
         # ROS 通信
         # ------------------------------------------------------------------
@@ -157,6 +221,19 @@ class VLMSceneNode(Node):
 
         self._pub_desc   = self.create_publisher(String, self._pub_desc_topic, 10)
         self._pub_status = self.create_publisher(String, self._pub_status_topic, 10)
+
+        # 火警告警 publisher 永远创建（即便 fire_alert_enabled=False，外部订阅也不会 404）
+        self._pub_fire   = self.create_publisher(String, self._pub_fire_topic, 10)
+        if self._fire_enabled:
+            self.create_subscription(String, self._sub_fire_topic,
+                                     self._cb_fire_prealert, qos_reliable)
+            self.get_logger().info(
+                f"[FIRE] 二次确认已启用 sub={self._sub_fire_topic} "
+                f"pub={self._pub_fire_topic} cooldown={self._fire_cooldown:.1f}s "
+                f"with_image={self._fire_with_image}"
+            )
+        else:
+            self.get_logger().info("[FIRE] 二次确认已禁用（fire_alert_enabled=False）")
 
         # 可选 Service：std_srvs/Trigger（无入参，调用后触发一次推理）
         if _HAS_TRIGGER:
@@ -251,6 +328,12 @@ class VLMSceneNode(Node):
         if bgr is None:
             return  # 还没收到图
 
+        # 1.5 火警二次确认优先级最高：若有 prealert，先走火警链路并立即返回
+        fire_payload = self._consume_fire_pending()
+        if fire_payload is not None:
+            self._run_fire_alert(bgr, fire_payload, frame_id, ts)
+            return  # 一次 tick 只发一次推理
+
         # 2. 检查是否被外部强制触发（service 或 REST）
         with self._force_lock:
             forced_prompt = self._force_pending
@@ -325,6 +408,169 @@ class VLMSceneNode(Node):
             "provider": self._provider.name,
             "trigger": decision.reason,
         })
+
+    # ----------------------------------------------------------------------
+    # 火警二次确认
+    # ----------------------------------------------------------------------
+    def _cb_fire_prealert(self, msg: String):
+        """收到 /fire_smoke/prealert（fire_smoke_node 经过去抖动后发的预警）。
+
+        说明：
+        - 只记录 pending，不在回调里调 VLM（回调要尽快返回）；
+        - 真正的 VLM 推理在 _tick_once 中进行（推理线程上下文）；
+        - 冷却期内的新 prealert 也会被覆盖（保留最新一条）。
+        """
+        if not self._fire_enabled:
+            return
+        try:
+            data = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"[FIRE] prealert JSON 解析失败: {e}; raw={msg.data[:120]}")
+            data = {"raw": msg.data}
+        with self._fire_lock:
+            self._fire_pending = data
+        # 让后续即便有 keyframe cooldown 也不会影响这次火警调用
+        if self._fire_force:
+            self._selector.force_reset()
+        self.get_logger().warn(
+            f"[FIRE] 收到 prealert hits={data.get('hits')} boxes={len(data.get('boxes', []) or [])}"
+        )
+
+    def _consume_fire_pending(self) -> Optional[dict]:
+        """取出 _fire_pending；冷却期内的请求直接丢弃，避免刷屏 / 烧 token。"""
+        with self._fire_lock:
+            data = self._fire_pending
+            self._fire_pending = None
+        if data is None:
+            return None
+        now = time.time()
+        if now - self._last_fire_alert_ts < self._fire_cooldown:
+            self.get_logger().info(
+                f"[FIRE] 在冷却期内（剩余 "
+                f"{self._fire_cooldown - (now - self._last_fire_alert_ts):.1f}s），丢弃 prealert"
+            )
+            return None
+        return data
+
+    def _run_fire_alert(self, bgr: np.ndarray, prealert: dict,
+                        frame_id: int, ts: float) -> None:
+        """对 prealert 做一次 VLM 二次确认，并把结构化结果发布到 /alert/fire。"""
+        if not self._provider_ready:
+            self.get_logger().warn("[FIRE] provider 未就绪，跳过二次确认")
+            return
+
+        small_bgr = downsample_keep_aspect(bgr, self._max_side)
+        # 用 prealert 自带的 fire/smoke 框做 detections 提示，VLM 看起来更有依据
+        fake_dets: List[Detection] = []
+        for b in (prealert.get("boxes") or [])[: self._max_dets]:
+            try:
+                fake_dets.append(Detection(
+                    class_id=int(b.get("class_id", -1)),
+                    class_name=str(b.get("class_name", "fire")),
+                    confidence=float(b.get("confidence", 0.0)),
+                    x1=float(b.get("x1", 0.0)),
+                    y1=float(b.get("y1", 0.0)),
+                    x2=float(b.get("x2", 0.0)),
+                    y2=float(b.get("y2", 0.0)),
+                    distance_m=float(b.get("distance_m", 0.0) or 0.0),
+                ))
+            except (TypeError, ValueError):
+                continue
+
+        req = VLMRequest(
+            frame_bgr=small_bgr,
+            detections=fake_dets,
+            user_prompt=self._fire_prompt,     # 用严格 JSON 火警 prompt
+            system_prompt=FIRE_SYSTEM_PROMPT,   # 覆盖通用导航 system prompt
+            crop_roi=False,
+            frame_id=frame_id,
+            timestamp=ts,
+            raw_prompt=True,                    # 关键：让 provider 不再追加导航话术
+        )
+
+        self.get_logger().warn(
+            f"[FIRE] 调 VLM 二次确认 provider={self._provider.name} "
+            f"boxes={len(fake_dets)} frame={frame_id}"
+        )
+        t0 = time.time()
+        try:
+            resp = self._provider.describe(req)
+        except Exception as e:
+            self.get_logger().error(f"[FIRE] VLM 异常: {e}")
+            self._publish_status({"type": "fire_error", "error": str(e)})
+            return
+        elapsed = (time.time() - t0) * 1000.0
+
+        parsed = self._parse_fire_json(resp.description or "")
+        level = str(parsed.get("level", "low")).lower()
+        if level not in ("none", "low", "high"):
+            level = "low"
+
+        out = {
+            "timestamp":      time.time(),
+            "frame_id":       frame_id,
+            "level":          level,
+            "fire_detected":  bool(parsed.get("fire_detected", False)),
+            "smoke_detected": bool(parsed.get("smoke_detected", False)),
+            "confidence":     float(parsed.get("confidence", 0.0) or 0.0),
+            "reason":         str(parsed.get("reason", "") or ""),
+            "recommendation": str(parsed.get("recommendation", "") or ""),
+            "raw":            resp.description or "",
+            "provider":       resp.provider or self._provider.name,
+            "model":          resp.model or self._provider.model,
+            "elapsed_ms":     round(resp.elapsed_ms or elapsed, 1),
+            "prealert":       prealert,
+        }
+        if self._fire_with_image:
+            try:
+                ok, buf = cv2.imencode(".jpg", small_bgr,
+                                       [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                if ok:
+                    out["image_b64"] = base64.b64encode(buf.tobytes()).decode("ascii")
+            except Exception as e:
+                self.get_logger().warn(f"[FIRE] 图像 base64 编码失败: {e}")
+
+        # 只有 level != none 才认为是“真火警”，更新冷却时间戳；
+        # level == none 视为误报，仍然发出但不进冷却（让下次 prealert 还能继续核查）
+        if level != "none":
+            self._last_fire_alert_ts = time.time()
+
+        msg = String()
+        msg.data = json.dumps(out, ensure_ascii=False)
+        self._pub_fire.publish(msg)
+
+        self._publish_status({
+            "type": "fire_alert",
+            "level": level,
+            "fire_detected": out["fire_detected"],
+            "smoke_detected": out["smoke_detected"],
+            "confidence": out["confidence"],
+            "elapsed_ms": round(elapsed, 1),
+        })
+        self.get_logger().warn(
+            f"[FIRE] 二次确认结果 level={level} fire={out['fire_detected']} "
+            f"smoke={out['smoke_detected']} conf={out['confidence']:.2f} "
+            f"elapsed={elapsed:.0f}ms reason={out['reason'][:60]}"
+        )
+
+    @staticmethod
+    def _parse_fire_json(text: str) -> dict:
+        """从 VLM 输出里抠出第一个 {...} JSON 对象；失败返回 {}。"""
+        if not text:
+            return {}
+        # 先尝试直接 parse（最理想情况）
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        # 退化：用正则抓第一段花括号内容
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            return {}
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return {}
 
     # ----------------------------------------------------------------------
     # 工具

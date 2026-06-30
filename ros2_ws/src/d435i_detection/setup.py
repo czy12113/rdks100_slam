@@ -31,6 +31,8 @@ setup(
             # ros2 run d435i_detection detection_node
             "detection_node = d435i_detection.detection_node:main",
             "detection_node_bpu = d435i_detection.detection_node_bpu:main",
+            # 火/烟检测（CPU YOLOv5，独立于通用 BPU 检测）
+            "fire_smoke_node = d435i_detection.fire_smoke_node:main",
         ],
     },
 )

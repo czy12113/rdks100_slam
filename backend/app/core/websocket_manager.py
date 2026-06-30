@@ -74,6 +74,7 @@ class WebSocketManager:
         "detection_results",  # YOLO 检测结果 JSON（目标框 + 距离）
         "vlm_description",    # VLM 场景自然语言描述（关键帧触发）
         "vlm_status",         # VLM 节点状态（provider/统计/错误）
+        "fire_alert",         # 火警告警（vlm_node 二次确认结果，所有页面常驻）
         "navigation",         # 导航状态
         "log",                # 实时日志
         "heartbeat",          # 心跳
@@ -81,12 +82,14 @@ class WebSocketManager:
 
     # 轻量 topic：连接建立时自动订阅（数据量小，不影响性能）
     # 重型 topic（lidar/video_*/slam_map）由前端按页面显式 subscribe
+    # fire_alert 列为默认订阅：火警关乎人身安全，所有页面都必须能弹窗
     DEFAULT_TOPICS = {
         "system",
         "robot_status",
         "heartbeat",
         "log",
         "odom",
+        "fire_alert",
     }
 
     def __init__(self):

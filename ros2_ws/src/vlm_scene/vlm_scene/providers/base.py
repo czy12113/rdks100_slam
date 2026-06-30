@@ -49,6 +49,10 @@ class VLMRequest:
     # 帧 metadata，仅用于日志 / 透传
     frame_id: int = 0
     timestamp: float = 0.0
+    # True 时 provider 必须把 user_prompt 当作完整 user 消息直接发，
+    # 不再追加自带的“下面是检测器给出的初步目标列表…”模板。
+    # 火警二次确认要求严格 JSON 输出，必须用 True 避免提示词冲突。
+    raw_prompt: bool = False
 
 
 @dataclass

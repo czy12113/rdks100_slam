@@ -89,6 +89,14 @@ ROS2_TOPIC_VLM_DESCRIPTION: str = "/vlm/scene_description"
 ROS2_TOPIC_VLM_STATUS: str = "/vlm/status"
 ROS2_SERVICE_VLM_ASK: str = "/vlm/ask"
 
+# ── 火警告警（fire_smoke_node + vlm_node 协同） ─────────────────────────────
+# fire_smoke_node 用 YOLOv5 做一阶火/烟检测 → /fire_smoke/prealert
+# vlm_node 二次确认 → /alert/fire（严格 JSON：level/fire_detected/...）
+# backend 仅订阅 /alert/fire 并直接 WS 转发给前端。
+ROS2_TOPIC_FIRE_ALERT: str = "/alert/fire"
+ROS2_TOPIC_FIRE_PREALERT: str = "/fire_smoke/prealert"     # 可选订阅（debug 用）
+ROS2_TOPIC_FIRE_RESULTS: str = "/fire_smoke/results"       # 可选订阅（每帧检测结果，debug 用）
+
 # ROS2 Service 名称
 ROS2_SERVICE_SAVE_MAP: str = "/slam/save_map"               # 保存地图
 ROS2_SERVICE_LOAD_MAP: str = "/map_server/load_map"         # 加载地图

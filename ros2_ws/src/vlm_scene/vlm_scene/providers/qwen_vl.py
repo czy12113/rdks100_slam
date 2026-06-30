@@ -104,8 +104,13 @@ class QwenVLProvider(BaseVLMProvider):
         img_b64 = self._encode_image(req.frame_bgr)
 
         # 2) 构造 messages
-        sys_text = req.system_prompt or self._default_system_prompt()
-        user_text = self._build_user_prompt(req.detections, req.user_prompt)
+        # raw_prompt=True：火警等场景需要严格 prompt，不要再混入默认导航话术
+        if req.raw_prompt and req.user_prompt:
+            sys_text = req.system_prompt or "你是一台具备视觉理解能力的安全监测助手。"
+            user_text = req.user_prompt
+        else:
+            sys_text = req.system_prompt or self._default_system_prompt()
+            user_text = self._build_user_prompt(req.detections, req.user_prompt)
 
         payload = {
             "model": self.model,
