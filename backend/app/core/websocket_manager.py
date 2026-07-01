@@ -75,6 +75,12 @@ class WebSocketManager:
         "vlm_description",    # VLM 场景自然语言描述（关键帧触发）
         "vlm_status",         # VLM 节点状态（provider/统计/错误）
         "fire_alert",         # 火警告警（vlm_node 二次确认结果，所有页面常驻）
+        # ── 创新点：动态行人 + 本地 VLM + Nav2 联合决策产生的安全事件 ──
+        # dynamic_person_obstacle_node 每次做出 stop / reroute / clear 决策时
+        # 发布结构化 JSON。前端所有页面都需要能弹告警，因此列为默认订阅。
+        "safety_event",
+        # 动态行人 3D 红点（PointCloud2 简化后）供 NavigationView 覆盖到地图上
+        "dynamic_person_points",
         "navigation",         # 导航状态
         "log",                # 实时日志
         "heartbeat",          # 心跳
@@ -82,7 +88,9 @@ class WebSocketManager:
 
     # 轻量 topic：连接建立时自动订阅（数据量小，不影响性能）
     # 重型 topic（lidar/video_*/slam_map）由前端按页面显式 subscribe
-    # fire_alert 列为默认订阅：火警关乎人身安全，所有页面都必须能弹窗
+    # fire_alert / safety_event 列为默认订阅：安全事件必须能弹窗
+    # vlm_status 也列为默认：前端 VideoView 需要立即知道当前 provider
+    # 是本地还是云端（用于渲染"本地离线 / 云端增强"标签）
     DEFAULT_TOPICS = {
         "system",
         "robot_status",
@@ -90,6 +98,8 @@ class WebSocketManager:
         "log",
         "odom",
         "fire_alert",
+        "safety_event",
+        "vlm_status",
     }
 
     def __init__(self):

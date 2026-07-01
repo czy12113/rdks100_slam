@@ -27,8 +27,9 @@ const AUTO_SUBSCRIBED_TOPICS = new Set<string>([
   'heartbeat',
   'log',
   'odom',
-  'vlm_status',   // VLM 节点心跳，前端任何页面都可观测
-  'fire_alert',   // 安全关键：任何页面都必须能收到火警，与后端 DEFAULT_TOPICS 对齐
+  'vlm_status',    // VLM 节点心跳，前端任何页面都可观测
+  'fire_alert',    // 安全关键：任何页面都必须能收到火警，与后端 DEFAULT_TOPICS 对齐
+  'safety_event',  // 创新点：动态行人 + Nav2 联合决策安全事件，所有页面都能弹窗
 ])
 
 class WebSocketClient {

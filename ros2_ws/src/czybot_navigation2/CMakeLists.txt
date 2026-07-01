@@ -43,4 +43,14 @@ install(PROGRAMS scripts/verify_chassis.sh DESTINATION lib/${PROJECT_NAME} RENAM
 # === 导航命令行 ===
 install(PROGRAMS scripts/send_goal.py DESTINATION lib/${PROJECT_NAME} RENAME send_goal)
 
+# === 创新点：动态行人障碍 + 安全决策节点 ===
+# 订阅 /detection/results + /vlm/scene_description + /camera/.../camera_info，
+# 发布 /dynamic_person_points（PointCloud2 供 Nav2 costmap 使用）、
+#      /vlm/safety_event（结构化安全事件，前端弹窗 / 状态显示）、
+#      /cmd_vel_estop（Empty，估计到人过近时紧急停车）。
+install(PROGRAMS scripts/dynamic_person_obstacle_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME dynamic_person_obstacle_node
+)
+
 ament_package()

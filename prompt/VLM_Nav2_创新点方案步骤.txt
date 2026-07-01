@@ -1,0 +1,477 @@
+RDK小车创新点方案步骤：本地轻量化VLM + Nav2动态避障 + 前端实时回传 + 断网/恢复对比
+生成日期：2026-07-01
+
+一、创新点定位
+
+核心创新点：
+在RDK S100小车上部署本地轻量化VLM，使小车在公网不可用、千问API超时的情况下，仍能依靠本地视觉理解、YOLO/深度测距、Nav2代价地图完成动态行人障碍物识别、重规划绕行、近距离停车告警；恢复网络后可切回云端VLM增强对话，形成“离线自主安全决策”和“在线增强语义交互”的前后对比。
+
+比赛展示关键词：
+1. 公网断开不影响自主导航安全。
+2. 本地VLM只做语义理解和告警解释，实时避障由YOLO/Depth/LiDAR/Nav2闭环完成，控制链路稳定。
+3. 网页刷新后自动重连，视频、地图、检测框、VLM描述、告警和延迟/FPS指标继续实时回传。
+4. 可用终端日志和curl超时证明云端不可达，但小车仍完成识别、停下、重规划、绕行。
+5. 清空防火墙规则或插回网线后切回qwen_vl，展示云端增强对话效果。
+
+二、当前项目已有基础
+
+已有VLM基础：
+目录：\\wsl.localhost\Ubuntu\home\kkk\rdks100_slam\ros2_ws\src\vlm_scene
+1. vlm_node.py 已订阅 /camera/camera/color/image_raw 和 /detection/results。
+2. 已发布 /vlm/scene_description、/vlm/status，并提供 /vlm/ask。
+3. provider 已插件化：qwen_vl、openai_vision、deepseek_text、mock、internvl_local。
+4. qwen_vl 已走 DashScope OpenAI兼容地址：
+   https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+5. internvl_local.py 目前是本地模型占位，需要补齐模型加载和推理。
+
+已有感知基础：
+1. d435i_detection 已用D435i RGB + Depth做YOLOv5检测和测距。
+2. 发布 /detection/results，包含 class_name、confidence、bbox、distance_m。
+3. 发布 /detection/annotated_image，前端能看到带框画面。
+
+已有Nav2基础：
+1. czybot_navigation2/config/nav2_params.yaml 已配置Nav2、local_costmap、global_costmap。
+2. local/global costmap 已使用 /scan_filtered 作为障碍观测源。
+3. MPPI/SmacPlanner2D 已针对阿克曼小车做过安全参数调优。
+
+已有前端基础：
+1. frontend/src/views/video/VideoView.vue 已展示 RGB、Depth、AI检测、VLM场景理解、FPS、推理耗时。
+2. frontend/src/views/slam/SlamView.vue 有地图canvas展示。
+3. frontend/src/api/websocket.ts 已有自动重连和重型topic重订阅逻辑。
+4. backend 已把 video_rgb、video_depth、video_annotated、detection_results、vlm_description、vlm_status、fire_alert 通过WebSocket推送。
+
+需要注意的现有小问题：
+1. 前端把 vlm_status 当成自动订阅topic，但后端 DEFAULT_TOPICS 里没有 vlm_status。刷新后VLM状态可能收不到。
+   处理方式二选一：
+   - 后端 app/core/websocket_manager.py 的 DEFAULT_TOPICS 增加 "vlm_status"。
+   - 或前端 src/api/websocket.ts 把 "vlm_status" 从 AUTO_SUBSCRIBED_TOPICS 移除，让页面主动subscribe。
+   推荐第一种，状态数据很轻。
+2. backend/app/services/ros2_bridge.py 里手动prompt透传尝试设置 /vlm_node/set_parameters，但实际节点名是 vlm_scene_node，且 vlm_node.py 未声明 next_user_prompt。若要做自定义提问，需要改为：
+   - service 只触发默认推理；或
+   - 新增自定义srv；或
+   - 在vlm_node声明 next_user_prompt，并把参数服务节点名改成 /vlm_scene_node/set_parameters。
+
+三、总体架构
+
+数据链路：
+D435i RGB/Depth + Livox/scan_filtered
+  -> d435i_detection：person检测、bbox、distance_m、标注画面
+  -> dynamic_person_obstacle_node：把行人检测转成Nav2可消费的动态障碍点云/激光点
+  -> Nav2 local_costmap/global_costmap：障碍膨胀、重规划、绕行
+  -> vlm_scene internvl_local：本地VLM对关键帧做语义确认和自然语言描述
+  -> safety_decision_node：近距离/横穿风险停车告警，必要时发布 /cmd_vel_estop
+  -> backend WebSocket：视频、地图、路径、VLM、告警、性能指标实时推前端
+  -> frontend：刷新后自动重连，同屏展示小车画面、地图、重规划状态、告警和帧率/延迟
+
+云端/本地切换：
+1. 离线比赛演示：provider:=internvl_local，本地VLM，不请求公网。
+2. 断网证明：curl 千问API地址超时，但 /vlm/scene_description 仍输出本地结果。
+3. 恢复网络：provider:=qwen_vl 或 openai_vision，展示云端增强对话。
+
+四、实施步骤
+
+阶段1：补齐本地轻量化VLM provider
+
+目标：
+把 ros2_ws/src/vlm_scene/vlm_scene/providers/internvl_local.py 从占位实现改成可运行本地推理。
+
+推荐模型路线：
+1. 首选轻量模型：InternVL2-2B / MiniCPM-V-2.x / Qwen2-VL-2B-Instruct 这类2B级别视觉语言模型。
+2. 推理形态按设备性能选择：
+   - 优先：RDK S100支持的BPU/HBM部署链路，模型预处理和视觉encoder尽量放硬件加速。
+   - 兜底：ONNXRuntime / int8 / int4 CPU推理，限制输入分辨率和触发频率。
+3. 不要让VLM跑控制闭环。VLM延迟通常高于避障控制周期，安全决策必须以YOLO/Depth/LiDAR/Nav2为实时主链，VLM只做语义确认、解释和告警文本。
+
+需要实现：
+1. internvl_local.py：
+   - healthcheck 检查 VLM_LOCAL_MODEL_PATH、VLM_LOCAL_TOKENIZER、推理后端是否存在。
+   - _load_local() 懒加载模型，避免节点启动直接失败。
+   - _infer(req) 接收 req.frame_bgr 和 req.detections，输出中文描述。
+   - 返回 VLMResponse(description, provider="internvl_local", model, elapsed_ms)。
+2. vlm_params.yaml：
+   - provider: "internvl_local"
+   - max_image_side: 448 或 512
+   - cooldown_sec: 1.0~3.0
+   - min_detections: 1
+   - max_detections: 5
+3. 输出格式建议保持JSON或结构化文本：
+   {
+     "scene": "前方约1.2米有行人...",
+     "risk": "stop" | "reroute" | "clear",
+     "reason": "行人处于小车前方安全距离内",
+     "elapsed_ms": 650
+   }
+
+验证命令：
+cd /home/kkk/rdks100_slam/ros2_ws
+source install/setup.bash
+ros2 launch vlm_scene vlm.launch.py provider:=internvl_local
+ros2 topic echo /vlm/status --once
+ros2 topic echo /vlm/scene_description --once
+
+阶段2：动态行人障碍物接入Nav2
+
+目标：
+放置动态行人后，小车可以识别、减速/停下、更新代价地图、触发Nav2重规划并绕行。
+
+推荐新增ROS2节点：
+包位置建议：ros2_ws/src/czybot_navigation2/scripts/dynamic_person_obstacle_node.py
+
+节点职责：
+1. 订阅 /detection/results。
+2. 只处理 class_name == "person" 且 confidence >= 0.55 的目标。
+3. 使用 bbox中心点 + distance_m 估算行人在 base_link 或 camera frame 下的位置。
+4. 发布 /dynamic_person_points，类型建议 PointCloud2。
+5. 发布 /vlm/safety_event 或 /navigation/safety_event，类型 std_msgs/String(JSON)，记录：
+   - event: person_detected / reroute / stop / clear
+   - distance_m
+   - confidence
+   - action
+   - timestamp
+6. 如果 distance_m <= 0.8m 或 bbox位于画面中间危险区域，发布 /cmd_vel_estop 并写日志：
+   [SAFETY] person too close, estop, distance=0.62m
+
+Nav2配置修改：
+在 nav2_params.yaml 的 local_costmap 和 global_costmap obstacle_layer 中增加 observation source。
+
+示例：
+observation_sources: scan dynamic_person
+dynamic_person:
+  topic: /dynamic_person_points
+  max_obstacle_height: 2.0
+  clearing: True
+  marking: True
+  data_type: "PointCloud2"
+  obstacle_max_range: 3.0
+  obstacle_min_range: 0.0
+  raytrace_max_range: 3.5
+  raytrace_min_range: 0.0
+
+演示逻辑：
+1. 小车导航到目标点。
+2. 人从前方或侧前方进入路径。
+3. detection_node 输出 person + distance。
+4. dynamic_person_obstacle_node 发布动态障碍点。
+5. local_costmap 出现动态障碍，MPPI减速并绕开。
+6. 如果距离过近，safety node触发 /cmd_vel_estop，小车停下并前端告警。
+7. 人离开后，costmap clearing 清除动态点，Nav2继续重规划到达目标。
+
+验证命令：
+ros2 topic echo /detection/results --once
+ros2 topic echo /dynamic_person_points --once
+ros2 topic echo /vlm/safety_event
+ros2 topic echo /cmd_vel
+ros2 topic echo /plan
+
+阶段3：本地VLM参与决策解释和告警
+
+目标：
+证明“本地轻量化VLM+Nav2完成，不再请求云端”。
+
+实现方式：
+1. detection_node 和 dynamic_person_obstacle_node 做实时风险判定。
+2. vlm_node 使用 internvl_local 对关键帧进行语义确认：
+   - 行人是否在通道正前方。
+   - 行人是否正在横穿。
+   - 是否建议停车等待或绕行。
+3. VLM结果发布 /vlm/scene_description。
+4. safety_event 中附带 vlm_summary 或最近一次VLM描述。
+5. 前端展示“本地VLM：internvl_local / elapsed_ms=xxx / risk=stop/reroute”。
+
+建议触发策略：
+1. person第一次出现：立即触发VLM。
+2. person距离变化超过0.5m：触发VLM。
+3. person进入1.0m危险区：强制触发VLM并停车。
+4. 心跳推理间隔：10~20s，避免本地模型占满CPU/BPU。
+
+关键日志：
+[VLM] provider=internvl_local model=xxx ready=true
+[VLM] infer_ok elapsed_ms=xxx trigger=person_near
+[SAFETY] action=reroute reason=person_on_path distance=1.35
+[SAFETY] action=stop reason=person_too_close distance=0.62
+[NAV2] replan path changed old_len=xx new_len=xx
+
+阶段4：前端实时回传和刷新恢复
+
+目标：
+网页刷新后，能自动重新连接WebSocket，继续看到小车画面、地图画面、检测结果、VLM描述、告警、FPS/延迟。
+
+需要修改/检查：
+1. backend/app/core/websocket_manager.py：
+   - DEFAULT_TOPICS 增加 "vlm_status"、必要时增加 "navigation"。
+   - TOPICS 增加 "safety_event" 或复用 "navigation"。
+2. backend/app/services/data_pusher.py：
+   - 新增 push_safety_event()，从 ros2_bridge.get_latest("safety_event") 转发到WebSocket。
+   - navigation状态里加入 replan_count、last_replan_ms、blocked_reason、safety_action。
+3. backend/app/services/ros2_bridge.py：
+   - 订阅 /dynamic_person_points 可选。
+   - 订阅 /vlm/safety_event，解析JSON缓存为 "safety_event"。
+4. frontend/src/api/websocket.ts：
+   - 确保刷新后重型topic会重新subscribe。
+   - 若后端不默认推 vlm_status，则不要把它放在 AUTO_SUBSCRIBED_TOPICS。
+5. frontend/src/views/video/VideoView.vue：
+   - 已有RGB、Depth、检测、VLM、FPS，继续使用。
+   - 增加“离线/云端模式”标签：internvl_local = 本地离线，qwen_vl = 云端增强。
+   - 展示 VLM elapsed_ms、检测 infer_ms、WebSocket fps。
+6. frontend/src/views/navigation/NavigationView.vue：
+   - 当前地图区域是预留界面。建议接入 slam_map/path/odom/safety_event：
+     - 画地图。
+     - 画全局路径 /plan。
+     - 画小车当前位置。
+     - 用红色圆点画动态行人障碍。
+     - 显示“重规划次数、最后一次重规划耗时、当前动作：绕行/停车/等待”。
+
+前端验收：
+1. 打开视频页，能看到RGB、Depth、检测框、VLM描述。
+2. 刷新浏览器，不重启后端，5秒内自动恢复画面和状态。
+3. 切到SLAM/Navigation页，地图和路径持续更新。
+4. 断网后，页面不依赖云端，仍能显示本地VLM和避障告警。
+
+阶段5：断网证明和云端恢复对比
+
+断网方式二选一：
+1. 拔网线或关闭外网网关。
+2. 防火墙阻断千问API域名/IP。
+
+Linux防火墙示例：
+sudo iptables -I OUTPUT -p tcp -d dashscope.aliyuncs.com --dport 443 -j REJECT
+
+如果域名规则不可用，先解析IP：
+getent ahosts dashscope.aliyuncs.com
+sudo iptables -I OUTPUT -p tcp -d <解析到的IP> --dport 443 -j REJECT
+
+curl超时证明：
+curl -m 5 https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+
+预期展示：
+1. curl输出超时、连接失败或被拒绝。
+2. vlm_node provider=internvl_local 仍在输出。
+3. 放置动态行人后：
+   - 前端检测框出现 person。
+   - 地图/导航页出现动态障碍。
+   - 小车重规划绕行。
+   - 近距离时停下告警。
+   - VLM描述说明“前方有行人，建议停车等待/绕行”。
+4. 终端展示FPS/延迟：
+   - video_rgb fps：约10~15fps。
+   - detection infer_ms：按现场实测记录。
+   - local VLM elapsed_ms：按现场实测记录。
+   - Nav2 replan latency：按日志记录。
+
+恢复网络：
+sudo iptables -F
+或插回网线/恢复Wi-Fi。
+
+切回云端增强：
+ros2 launch vlm_scene vlm.launch.py provider:=qwen_vl
+
+恢复后展示：
+1. curl 千问API地址不再超时。
+2. /vlm/status 显示 provider=qwen_vl。
+3. 前端VLM标签从“本地离线”切换到“云端增强”。
+4. 手动提问更细：
+   - “请描述当前障碍物对导航的影响”
+   - “如果我是评委，请总结刚才小车做了哪些自主决策”
+
+六、建议答辩演示流程
+
+演示前准备：
+1. 启动相机：
+   ros2 launch d435i_bringup d435i_camera.launch.py
+2. 启动检测：
+   ros2 launch d435i_detection detection.launch.py
+3. 启动SLAM或定位+Nav2：
+   ros2 launch czybot_navigation2 navigation_real_robot.launch.py
+4. 启动本地VLM：
+   ros2 launch vlm_scene vlm.launch.py provider:=internvl_local
+5. 启动后端和前端。
+6. 打开视频页和导航页。
+
+演示脚本：
+1. 正常联网状态下先展示网页刷新：
+   - 刷新页面。
+   - 画面、地图、VLM状态自动恢复。
+2. 切到离线模式：
+   - provider=internvl_local。
+   - 执行 curl -m 5 千问API地址，展示超时。
+3. 设置目标点，小车开始导航。
+4. 人站到路径前方：
+   - 画面出现 person 检测框和距离。
+   - VLM输出本地场景描述。
+   - Nav2路径变化，小车绕行。
+5. 人突然靠近：
+   - 小车停下。
+   - 前端弹出“行人过近，停车等待”。
+   - 终端日志显示 /cmd_vel_estop 和 safety_event。
+6. 人离开：
+   - costmap清除障碍。
+   - 小车恢复导航。
+7. 恢复公网：
+   - sudo iptables -F 或插回网线。
+   - curl恢复。
+   - 重启/切换 vlm_node provider=qwen_vl。
+   - 前端显示云端增强描述，支持更自然的追问。
+
+七、指标建议
+
+必须展示的指标：
+1. 网页刷新重连时间：目标 < 5s。
+2. RGB回传帧率：目标 10~15fps。
+3. 检测帧率/延迟：显示 infer_ms，目标现场稳定即可。
+4. 本地VLM延迟：目标 0.5~3s，取决于模型和硬件。
+5. 动态障碍响应：
+   - person出现到前端检测显示：< 1s。
+   - person进入危险区到停车：< 0.5s，实际以安全为准。
+   - person离开到恢复导航：2~5s，取决于costmap clearing。
+6. 云端不可用证明：curl -m 5 超时。
+7. 云端恢复证明：curl成功，provider切换qwen_vl。
+
+八、风险和兜底
+
+1. 本地VLM太慢：
+   - 降低 max_image_side 到448。
+   - cooldown_sec 调大到3~5s。
+   - VLM只在person出现/进入危险区时触发。
+   - 安全动作仍由YOLO/Depth/Nav2执行，不等待VLM。
+
+2. BPU模型转换来不及：
+   - 使用ONNXRuntime/CPU int8或mock结构化本地provider先跑通闭环。
+   - 答辩时强调provider插件化，可替换本地推理后端，比赛现场展示离线闭环行为。
+
+3. 动态障碍不进costmap：
+   - 先用 /scan_filtered 的真实激光动态障碍完成Nav2绕行。
+   - dynamic_person_obstacle_node 同步发布告警和前端红点，作为语义增强。
+   - 再逐步把 /dynamic_person_points 接入costmap。
+
+4. 前端刷新后缺少VLM状态：
+   - 修 DEFAULT_TOPICS 或 AUTO_SUBSCRIBED_TOPICS。
+   - 页面 mounted 时调用 /api/vlm/status 和 /api/vlm/history 兜底。
+
+5. 近距离停车不够快：
+   - 不要等Nav2规划失败。
+   - safety node 根据 distance_m 直接发布 /cmd_vel_estop。
+   - 停车阈值建议 0.8m，恢复阈值建议 1.2m，避免抖动。
+
+九、最终交付清单
+
+代码交付：
+1. vlm_scene/providers/internvl_local.py：本地轻量VLM真实推理。
+2. czybot_navigation2/scripts/dynamic_person_obstacle_node.py：行人动态障碍和安全事件。
+3. nav2_params.yaml：costmap增加 dynamic_person observation source。
+4. ros2_bridge.py / data_pusher.py / websocket_manager.py：safety_event、vlm_status、navigation状态推送。
+5. VideoView.vue / NavigationView.vue：本地/云端模式、FPS/延迟、动态障碍、重规划状态展示。
+
+演示交付：
+1. 离线模式视频：curl千问超时，小车仍识别行人、重规划、停车告警。
+2. 恢复模式视频：清空防火墙/插回网线，切回qwen_vl，云端增强对话。
+3. 终端日志截图：provider、elapsed_ms、infer_ms、safety_event、/cmd_vel_estop。
+4. 前端截图：视频、地图、VLM描述、FPS、延迟、告警同屏。
+
+一句话答辩总结：
+本项目不是把大模型简单接到网页，而是把本地轻量化VLM嵌入ROS2导航安全链路：公网不可用时，小车仍可依靠本地视觉语义、目标检测、深度测距和Nav2完成动态行人识别、重规划绕行与停车告警；公网恢复后再切回云端VLM增强自然语言交互，实现离线自主安全和在线智能交互的双模式对比。
+
+
+======================================================================
+十、落地记录（v1 · 已实施）
+======================================================================
+
+本节记录了方案实际落地时的关键文件、命令与验收要点，供后续维护 / 复现使用。
+
+10.1 已实施改动索引
+--------------------
+新增：
+  - ros2_ws/src/czybot_navigation2/scripts/dynamic_person_obstacle_node.py
+      · 订阅 /detection/results + /camera/aligned_depth_to_color/image_raw
+      · 发布 /dynamic_person_points (sensor_msgs/PointCloud2) 给 Nav2 costmap
+      · 发布 /vlm/safety_event (std_msgs/String, JSON) 给前端展示
+      · 双阈值迟滞：stop=0.8m / recover=1.2m，防止抖动
+  - frontend/src/composables/useSafetyEvent.ts        (单例，counters + dismiss)
+  - frontend/src/composables/useVlmProvider.ts        (单例，本地/云端 label)
+  - frontend/src/components/SafetyEventOverlay.vue    (顶部横幅 + 右下 toast + 弹窗)
+  - scripts/demo_offline.sh                           (iptables 断网 + 切本地)
+  - scripts/demo_recover.sh                           (清 iptables + 切云端)
+  - INNOVATION_DEMO.md                                (演示手册 & 口播稿)
+
+修改：
+  - ros2_ws/src/vlm_scene/vlm_scene/providers/internvl_local.py
+      · 完整实现 HuggingFace 懒加载 + Qwen2-VL / MiniCPM-V / InternVL 分派
+      · 加载失败自动回落到规则兜底，backend 字段暴露给前端区分
+  - ros2_ws/src/vlm_scene/config/vlm_params.yaml
+      · 新增 local_model_path / local_model_type / local_dtype 等
+  - ros2_ws/src/vlm_scene/launch/vlm.launch.py
+      · LaunchArgs 补齐本地 VLM 参数；additional_env 透传 VLM_LOCAL_*
+  - ros2_ws/src/vlm_scene/vlm_scene/vlm_node.py
+      · declare_parameter local_* + next_user_prompt
+      · provider 实例化前把 launch 参数写回 os.environ 便于 provider 读取
+  - ros2_ws/src/czybot_navigation2/config/nav2_params.yaml
+      · local_costmap / global_costmap obstacle_layer 增加
+        observation_sources: "scan dynamic_person"，topic /dynamic_person_points
+  - ros2_ws/src/czybot_navigation2/CMakeLists.txt
+      · install(PROGRAMS scripts/dynamic_person_obstacle_node.py ...)
+  - backend/app/core/config.py
+      · ROS2_TOPIC_SAFETY_EVENT / ROS2_TOPIC_DYNAMIC_PERSON_POINTS
+  - backend/app/core/websocket_manager.py
+      · TOPICS 增加 safety_event / dynamic_person_points
+      · DEFAULT_TOPICS 增加 safety_event / vlm_status (刷新即用)
+  - backend/app/services/ros2_bridge.py
+      · 新增 safety_event / dynamic_person_points 订阅 + 解析函数
+      · call_vlm_ask 修正参数服务路径：/vlm_scene_node/set_parameters
+  - backend/app/services/data_pusher.py
+      · push_safety_event (2Hz) + push_dynamic_person_points (5Hz, has_subscribers 短路)
+  - frontend/src/api/websocket.ts
+      · AUTO_SUBSCRIBED_TOPICS 增加 safety_event
+  - frontend/src/App.vue
+      · 挂载 <SafetyEventOverlay /> 与 <FireAlertOverlay /> 并列
+  - frontend/src/views/video/VideoView.vue
+      · 场景理解卡片顶部增加 "本地/云端" 圆点徽标 + 平均延迟
+  - frontend/src/views/navigation/NavigationView.vue
+      · 地图区域用 SVG 画雷达式坐标 + 动态障碍红点 + 三圈阈值虚线
+      · 右侧新增"动态行人避障"状态面板：最近距离/人数/绕行/停车/急停/重规划/后端
+
+
+10.2 关键决策与偏差说明
+-----------------------
+1) 节点名统一：vlm_scene_node（不是 vlm_node）。
+   backend/call_vlm_ask 原来写成 /vlm_node/set_parameters，会导致 provider 切换
+   静默失败；已修复。
+
+2) Nav2 与 safety node 的职责边界：
+   实施上把"停车 / 急停"完全交给 Nav2 costmap + local planner，
+   dynamic_person_obstacle_node 只负责发布 PointCloud2 + JSON 事件；
+   避免多头下发 /cmd_vel 冲突。
+   如后续需要"抢占式硬急停"，可以在 node 里加发 /cmd_vel_estop 但需谨慎。
+
+3) 本地 VLM 加载失败的兜底：
+   internvl_local provider 一旦模型加载失败自动切规则兜底（backend="rule_based"），
+   前端徽标会展示"本地规则兜底"（黄色），确保演示不会翻车。
+
+4) 前端 composable 单例：
+   useSafetyEvent / useVlmProvider 都是模块级单例，
+   AUTO_SUBSCRIBED_TOPICS 覆盖后连 vlm_status / safety_event 都不需要页面显式 subscribe，
+   刷新页面立即恢复。
+
+5) demo_offline.sh 用 iptables REJECT 而不是 DROP：
+   REJECT 会让 curl 立刻收到 "connection refused"，
+   截图 / 日志更明确；DROP 只会静默 timeout，演示效果差。
+
+
+10.3 验收清单（复现演示前逐项 tick）
+-------------------------------------
+[ ] ros2 topic list | grep -E "dynamic_person_points|vlm/safety_event|vlm/status"
+[ ] ros2 topic hz /vlm/scene_description   (本地/云端都应 >0.2Hz)
+[ ] ros2 param get /vlm_scene_node provider (可切 internvl_local / qwen_vl)
+[ ] curl -sS http://localhost:8000/health   (backend 存活)
+[ ] 浏览器打开前端，VLM 徽标显示颜色和文本
+[ ] sudo bash scripts/demo_offline.sh       (第 3 步 curl 应报 timeout/refused)
+[ ] 放置行人 → 网页出现红点 + 停车横幅
+[ ] sudo bash scripts/demo_recover.sh       (徽标恢复蓝色)
+
+
+10.4 已知限制 & 后续工作
+------------------------
+- 本地 VLM 推理在纯 CPU 上耗时较长（>3s），建议启用 NPU / GPU；
+  规则兜底提供保底响应，保证 UI 不阻塞。
+- dynamic_person_obstacle_node 使用相机内参默认值，
+  若使用非 D435i 相机需要通过参数覆盖 fx/fy/cx/cy。
+- SafetyEventOverlay 与 FireAlertOverlay 目前只做视觉分层（z-index）避免遮挡，
+  尚未做"火警优先级抢占安全事件"的强一致合并；如遇同时触发可以扩展。

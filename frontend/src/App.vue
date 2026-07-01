@@ -2,6 +2,8 @@
   <router-view />
   <!-- 全局火警告警层：横幅 + 弹窗 + 报警音，所有页面共享 -->
   <FireAlertOverlay />
+  <!-- 全局动态行人避障事件层：横幅（stop）+ toast（reroute）+ 详情弹窗 -->
+  <SafetyEventOverlay />
 </template>
 
 <script setup lang="ts">
@@ -10,6 +12,7 @@ import { useRobotStore } from '@/stores/robot'
 import { wsClient } from '@/api/websocket'
 import { controlApi } from '@/api/http'
 import FireAlertOverlay from '@/components/FireAlertOverlay.vue'
+import SafetyEventOverlay from '@/components/SafetyEventOverlay.vue'
 
 const robotStore = useRobotStore()
 

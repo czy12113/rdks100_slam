@@ -97,6 +97,13 @@ ROS2_TOPIC_FIRE_ALERT: str = "/alert/fire"
 ROS2_TOPIC_FIRE_PREALERT: str = "/fire_smoke/prealert"     # 可选订阅（debug 用）
 ROS2_TOPIC_FIRE_RESULTS: str = "/fire_smoke/results"       # 可选订阅（每帧检测结果，debug 用）
 
+# ── 动态行人安全事件（创新点：本地 VLM + Nav2 联合决策）─────────────────────
+# dynamic_person_obstacle_node 每次做出 stop / reroute / clear 决策时，
+# 会发布结构化 JSON 到 /vlm/safety_event，供前端弹窗、图标闪烁、状态显示。
+# 前端 NavigationView 还会订阅 /dynamic_person_points（可视化红点）。
+ROS2_TOPIC_SAFETY_EVENT: str = "/vlm/safety_event"
+ROS2_TOPIC_DYNAMIC_PERSON_POINTS: str = "/dynamic_person_points"
+
 # ROS2 Service 名称
 ROS2_SERVICE_SAVE_MAP: str = "/slam/save_map"               # 保存地图
 ROS2_SERVICE_LOAD_MAP: str = "/map_server/load_map"         # 加载地图

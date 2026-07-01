@@ -24,7 +24,13 @@ API Key 通过环境变量传入（launch 会自动透传）：
   VLM_OPENAI_BASE_URL    openai_vision endpoint
   VLM_OPENAI_MODEL       openai_vision 模型名
   DEEPSEEK_API_KEY       deepseek_text
-  VLM_INTERNVL_MODEL_PATH internvl_local
+
+本地轻量化 VLM（internvl_local）相关环境变量：
+  VLM_LOCAL_MODEL_PATH     HF 格式模型目录（含 config.json）
+  VLM_LOCAL_MODEL_TYPE     auto / qwen2_vl / minicpmv / internvl
+  VLM_LOCAL_DEVICE         cpu / cuda / auto
+  VLM_LOCAL_DTYPE          float16 / bfloat16 / float32
+  VLM_LOCAL_MAX_NEW_TOKENS 生成上限，默认 128
 """
 
 import os
@@ -53,6 +59,28 @@ def generate_launch_description():
         description="无变化时多久强制刷新（秒）",
     )
 
+    # ── 本地轻量化 VLM（internvl_local）参数 ──────────────────────────────────
+    local_model_path_arg = DeclareLaunchArgument(
+        "local_model_path", default_value="",
+        description="本地 HF 模型目录（provider=internvl_local 时生效）；留空则走规则兜底",
+    )
+    local_model_type_arg = DeclareLaunchArgument(
+        "local_model_type", default_value="auto",
+        description="本地模型类型：auto / qwen2_vl / minicpmv / internvl",
+    )
+    local_device_arg = DeclareLaunchArgument(
+        "local_device", default_value="auto",
+        description="本地推理设备：cpu / cuda / auto",
+    )
+    local_dtype_arg = DeclareLaunchArgument(
+        "local_dtype", default_value="float16",
+        description="本地推理精度：float16 / bfloat16 / float32",
+    )
+    local_max_new_tokens_arg = DeclareLaunchArgument(
+        "local_max_new_tokens", default_value="128",
+        description="本地推理生成 token 上限",
+    )
+
     params_file = PathJoinSubstitution([
         FindPackageShare("vlm_scene"),
         "config",
@@ -65,6 +93,19 @@ def generate_launch_description():
     _sys_pp = os.environ.get("PYTHONPATH", "")
     _merged_pp = _venv_sp + (":" + _sys_pp if _sys_pp else "")
 
+    # 透传本地 VLM 环境变量：若 launch 参数为空则回退到当前 shell 里的同名环境变量
+    _env = {
+        "PYTHONPATH": _merged_pp,
+        # 这些 env 会被 internvl_local provider 读取
+        "VLM_LOCAL_MODEL_PATH":     os.environ.get("VLM_LOCAL_MODEL_PATH", ""),
+        "VLM_LOCAL_MODEL_TYPE":     os.environ.get("VLM_LOCAL_MODEL_TYPE", "auto"),
+        "VLM_LOCAL_DEVICE":         os.environ.get("VLM_LOCAL_DEVICE", "auto"),
+        "VLM_LOCAL_DTYPE":          os.environ.get("VLM_LOCAL_DTYPE", "float16"),
+        "VLM_LOCAL_MAX_NEW_TOKENS": os.environ.get("VLM_LOCAL_MAX_NEW_TOKENS", "128"),
+        # 兼容旧变量名（老版本 README 用的是 VLM_INTERNVL_MODEL_PATH）
+        "VLM_INTERNVL_MODEL_PATH":  os.environ.get("VLM_INTERNVL_MODEL_PATH", ""),
+    }
+
     vlm_node = Node(
         package="vlm_scene",
         executable="vlm_node",
@@ -72,15 +113,21 @@ def generate_launch_description():
         parameters=[
             params_file,
             {
-                "provider":      LaunchConfiguration("provider"),
-                "model":         LaunchConfiguration("model"),
-                "cooldown_sec":  LaunchConfiguration("cooldown_sec"),
-                "heartbeat_sec": LaunchConfiguration("heartbeat_sec"),
+                "provider":             LaunchConfiguration("provider"),
+                "model":                LaunchConfiguration("model"),
+                "cooldown_sec":         LaunchConfiguration("cooldown_sec"),
+                "heartbeat_sec":        LaunchConfiguration("heartbeat_sec"),
+                # 本地 VLM 相关（provider=internvl_local 时读取）
+                "local_model_path":     LaunchConfiguration("local_model_path"),
+                "local_model_type":     LaunchConfiguration("local_model_type"),
+                "local_device":         LaunchConfiguration("local_device"),
+                "local_dtype":          LaunchConfiguration("local_dtype"),
+                "local_max_new_tokens": LaunchConfiguration("local_max_new_tokens"),
             },
         ],
         output="screen",
         emulate_tty=True,
-        additional_env={"PYTHONPATH": _merged_pp},
+        additional_env=_env,
     )
 
     return LaunchDescription([
@@ -88,6 +135,11 @@ def generate_launch_description():
         model_arg,
         cooldown_arg,
         heartbeat_arg,
+        local_model_path_arg,
+        local_model_type_arg,
+        local_device_arg,
+        local_dtype_arg,
+        local_max_new_tokens_arg,
         LogInfo(msg="[vlm_scene] 启动 VLM 场景理解节点..."),
         vlm_node,
     ])

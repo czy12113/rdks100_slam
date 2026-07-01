@@ -744,7 +744,12 @@ local_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: scan
+        # ★ 创新点：新增 dynamic_person 数据源
+        # 由 dynamic_person_obstacle_node（vlm 侧）发布，把 YOLO 检测到的
+        # 行人 bbox 反投影为 3D 点云注入 Nav2，让全局/局部代价地图立即认为
+        # "前方那块位置不可通行"，从而触发 Nav2 重新规划绕开。
+        # 与 /scan_filtered 并列而不是替换：lidar 保底、camera 加成。
+        observation_sources: scan dynamic_person
         scan:
           # 与 czybot_slam 滤波链对齐，使用 /scan_filtered
           topic: /scan_filtered
@@ -756,6 +761,19 @@ local_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
           obstacle_min_range: 0.0
+        dynamic_person:
+          topic: /dynamic_person_points
+          # 行人身高上限（米），高于此值的点会被丢弃
+          max_obstacle_height: 2.0
+          # marking=True 才会写入 costmap；clearing=True 允许人离开后清除
+          clearing: True
+          marking: True
+          data_type: "PointCloud2"
+          # 3m 之外的行人不放进 local_costmap（超出感知可靠范围）
+          obstacle_max_range: 3.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 3.5
+          raytrace_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
@@ -775,7 +793,10 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: scan
+        # ★ 创新点：与 local_costmap 保持一致，全局层同样接收 /dynamic_person_points
+        # 这样 planner_server (SmacPlanner2D) 也能看到行人，从而在全局路径
+        # 层面直接绕开，而不是等到 local controller 再急刹。
+        observation_sources: scan dynamic_person
         scan:
           topic: /scan_filtered
           max_obstacle_height: 2.0
@@ -786,6 +807,16 @@ global_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 2.5
           obstacle_min_range: 0.0
+        dynamic_person:
+          topic: /dynamic_person_points
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "PointCloud2"
+          obstacle_max_range: 3.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 3.5
+          raytrace_min_range: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True

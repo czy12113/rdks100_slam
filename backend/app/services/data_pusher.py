@@ -414,6 +414,65 @@ async def push_fire_alert():
         await asyncio.sleep(0.5)
 
 
+async def push_safety_event():
+    """
+    推送安全事件（/vlm/safety_event → safety_event topic）。
+
+    dynamic_person_obstacle_node 每次动作状态变化（clear/reroute/stop 切换）
+    时会推一次事件；backend 仅在 timestamp 前进时转发，前端据此显示：
+      - 状态图标（绿/黄/红）
+      - stop 时弹窗
+      - reroute 时高亮"绕行中"
+      - 汇报当前本地/云端 provider（vlm_summary.backend）
+    这是本次创新点最直接对外可见的信号，因此单独一个 push 任务，1Hz 足够。
+    """
+    _last_ts = 0.0
+    while True:
+        try:
+            if ros2_bridge.is_enabled:
+                data = ros2_bridge.get_latest("safety_event")
+                ts = float(data.get("timestamp", 0.0)) if data else 0.0
+                if data and ts > _last_ts:
+                    _last_ts = ts
+                    await ws_manager.broadcast("safety_event", data)
+                    action = data.get("action")
+                    if action in ("stop", "reroute"):
+                        logger.warning(
+                            "[PUSH] safety_event action=%s dist=%.2fm reason=%s",
+                            action,
+                            float(data.get("min_distance_m", 0.0) or 0.0),
+                            data.get("reason", ""),
+                        )
+        except Exception as e:
+            logger.error("[PUSH] topic=safety_event 推送失败: %s", e)
+        await asyncio.sleep(0.5)
+
+
+async def push_dynamic_person_points():
+    """
+    推送动态行人点云简化版（/dynamic_person_points → dynamic_person_points topic）。
+
+    仅在有订阅者时才广播（has_subscribers 判定），避免没人看时也把序列化 CPU 花掉。
+    Nav2 costmap 是另一个 ROS2 内部消费者，这里的推送只面向前端 NavigationView。
+    """
+    _last_ts = 0.0
+    while True:
+        try:
+            if not ws_manager.has_subscribers("dynamic_person_points"):
+                await asyncio.sleep(0.5)
+                continue
+            if ros2_bridge.is_enabled:
+                data = ros2_bridge.get_latest("dynamic_person_points")
+                ts = float(data.get("timestamp", 0.0)) if data else 0.0
+                if data and ts > _last_ts:
+                    _last_ts = ts
+                    await ws_manager.broadcast("dynamic_person_points", data)
+        except Exception as e:
+            logger.error("[PUSH] topic=dynamic_person_points 推送失败: %s", e)
+        # 5Hz：跟随 dynamic_person_obstacle_node 的 publish_rate_hz
+        await asyncio.sleep(0.2)
+
+
 async def start_all_push_tasks():
     """启动所有后台推送任务"""
     tasks = [
@@ -429,6 +488,9 @@ async def start_all_push_tasks():
         asyncio.create_task(push_vlm_description(), name="push_vlm"),    # VLM 场景描述
         asyncio.create_task(push_vlm_status(), name="push_vlm_status"),  # VLM 节点状态
         asyncio.create_task(push_fire_alert(), name="push_fire_alert"),  # 火警二次确认结果
+        # ── 创新点：动态行人 + 本地 VLM + Nav2 联合决策 ──
+        asyncio.create_task(push_safety_event(), name="push_safety_event"),
+        asyncio.create_task(push_dynamic_person_points(), name="push_dyn_person"),
     ]
     logger.info("[PUSH] 所有数据推送任务已启动，共 %d 个", len(tasks))
     return tasks

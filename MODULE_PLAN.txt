@@ -2,7 +2,7 @@
   RDK S100 智能机器人上位机系统 — 模块化迭代演进方案
 ================================================================================
 
-版本: 13.0（归档版）  |  日期: 2026-06-30  |  当前状态: 火/烟 YOLOv5 一阶检测 + Qwen-VL 二次确认 + 前端全局火警告警闭环已接入；Nav2 实车导航链路仍需继续现场调参
+版本: 14.0（归档版）  |  日期: 2026-07-01  |  当前状态: VLM 云端/本地无感切换 + 动态行人障碍 Nav2 联合决策 + 火警二次确认创新点已接入；Nav2 实车导航链路仍需继续现场调参
 
 ─────────────────────────────────────────────────────────────────────────────
 版本记录
@@ -616,6 +616,61 @@ v13.0 (2026-06-30) — 火灾/烟雾识别情景接入（YOLOv5 一阶筛查 + Q
     - 按 FIRE_SMOKE_GUIDE.md 第 2 节启动终端 A~E，再按第 3 节用手机播放火焰视频对准 D435i。
     - 25 秒内应看到：终端 C 输出 [FIRE] 预警发出 hits=3；终端 D 输出 [FIRE] 二次确认结果 level=high；终端 E 输出 [PUSH] fire_alert level=high；浏览器出现顶部红色脉冲横幅、详情弹窗和 4 声警报音。
 
+v14.0 (2026-07-01) — VLM+Nav2 创新点归档（公网断连本地 VLM 兜底 + 动态行人避障 + 演示脚本）
+
+  · 本版定位：
+    - 在 v12.0/V13.0 的 VLM 场景理解与火警二次确认基础上，补齐比赛展示所需的“断网仍可工作”创新点闭环。
+    - 创新点一句话：当机器人失去公网连接时，仍能借助本地轻量 VLM + Nav2 完成动态行人避障、火警二次确认和语义决策；公网恢复后无感切回云端大模型。
+    - 当前工程运行目标仍以 ROS 2 Humble 为准；本机可有 Jazzy，但板端 sunrise@ubuntu 和项目启动脚本按 Humble 环境执行。
+
+  · VLM provider 热切换：
+    - ros2_ws/src/vlm_scene/vlm_scene/providers/internvl_local.py 补齐本地轻量 VLM provider，支持 Qwen2-VL / MiniCPM-V / InternVL / AutoVision2Seq 的 HF 通用加载。
+    - 本地模型不可用时自动走 _rule_based_infer 规则兜底，只依赖 detection_node 的类别、bbox、distance_m，输出 scene/risk/reason/suggestion 结构化 JSON，保证断网演示不请求公网。
+    - ros2_ws/src/vlm_scene/config/vlm_params.yaml 增加 local_model_path、local_model_type、local_device、local_dtype、local_max_new_tokens、local_stop_distance_m、local_reroute_distance_m 等参数。
+    - ros2_ws/src/vlm_scene/launch/vlm.launch.py 与 vlm_node.py 声明 local_*、next_user_prompt、fire_alert_* 参数，launch 会把本地模型参数写入 VLM_LOCAL_* 环境变量。
+    - vlm_node.py 新增 add_on_set_parameters_callback(self._on_params_changed)：外部 ros2 param set provider 后会在锁内重建 self._provider，并发布 /vlm/status {"type":"provider_switched","provider":"...","ready":true}。
+    - _tick_once() 与 _run_fire_alert() 使用 provider_ref 快照，锁外执行 describe()，避免 provider 切换时阻塞节点主线程。
+
+  · 后端 /vlm/ask 修复：
+    - backend/app/services/ros2_bridge.py 的 call_vlm_ask() 改为先调用 /vlm_scene_node/set_parameters 写入 next_user_prompt，再触发 /vlm/ask。
+    - 修复旧实现使用 /vlm_node/set_parameters 或只更新参数不重建 provider 的问题，保证手动 prompt 和 provider 切换真正生效。
+    - providers/keys.py 的 Key 获取优先级归档为：函数 kwargs > 环境变量 > keys.py 常量 > fallback。
+
+  · 动态行人障碍 + Nav2 联合决策：
+    - ros2_ws/src/czybot_navigation2/scripts/dynamic_person_obstacle_node.py 新增动态行人安全节点，订阅 /detection/results、/odom、/vlm/scene_description 与 CameraInfo。
+    - 节点将 D435i 检测到的 person 按深度和相机模型投影到机器人/map 近似坐标，发布 /dynamic_person_points（PointCloud2），供 Nav2 costmap observation_sources 使用。
+    - 节点同时发布 /vlm/safety_event（std_msgs/String JSON），action 为 clear / reroute / stop，供前端弹窗、红点、重规划计数和安全动作徽章展示。
+    - CMakeLists.txt 安装 dynamic_person_obstacle_node；nav2_params.yaml 的 local/global costmap 增加 dynamic_person observation source，collision_monitor 链路保留 cmd_vel_safe。
+
+  · 后端/前端安全事件接入：
+    - backend/app/core/config.py 新增 ROS2_TOPIC_SAFETY_EVENT="/vlm/safety_event"、ROS2_TOPIC_DYNAMIC_PERSON_POINTS="/dynamic_person_points"。
+    - backend/app/core/websocket_manager.py 新增 safety_event、dynamic_person_points、vlm_status 默认/可订阅 topic。
+    - backend/app/services/ros2_bridge.py 新增 safety_event 与 dynamic_person_points 订阅解析。
+    - backend/app/services/data_pusher.py 新增 push_safety_event()、push_dynamic_person_points()、push_vlm_status()。
+    - frontend/src/composables/useVlmProvider.ts 根据 /vlm/status 区分 qwen_vl 云端、internvl_local 本地轻量 VLM、rule_based 本地规则兜底。
+    - frontend/src/composables/useSafetyEvent.ts 与 components/SafetyEventOverlay.vue 接入全局动态行人安全事件；App.vue 根节点挂载 FireAlertOverlay 和 SafetyEventOverlay。
+    - frontend/src/views/video/VideoView.vue 显示“云端/本地”provider 徽章；NavigationView.vue 显示动态障碍红点、最近距离、重规划次数和安全动作状态。
+
+  · 演示脚本与手册：
+    - scripts/demo_offline.sh：iptables 封公网 + provider 切换为 internvl_local，演示徽章从“云端·通义千问VL”变为“本地轻量VLM”。
+    - scripts/demo_recover.sh：清理 iptables + provider 切回 qwen_vl，演示公网恢复后云端 provider 无感恢复。
+    - 两个脚本均显式 source /opt/ros/$ROS_DISTRO/setup.bash 与 workspace install/setup.bash，并在 sudo 场景下回到原用户 DDS 环境。
+    - 脚本加入 ros2 daemon stop/start，规避 Humble ros2 daemon 缓存陈旧导致“节点不存在”的假阴性。
+    - INNOVATION_DEMO.md 新增完整使用手册、FAQ、验证清单与 3 分钟口播稿。
+
+  · 关键踩坑归档：
+    - sudo bash 后 ros2 命令找不到：脚本内 _source_ros_env() 显式 source ROS 与工作空间环境。
+    - sudo 后 ros2 param set 看不到 /vlm_scene_node：用 sudo -u "$SUDO_USER" 回到原用户，并从 /proc/<vlm_pid>/environ 恢复 DDS/ROS_DOMAIN_ID/RMW 环境。
+    - ros2 param set provider 返回 [ok] 但仍打云端：参数值变化不会自动重建对象，必须在 vlm_node.py 参数回调里 create_provider() 重建 self._provider。
+    - Humble ros2 daemon 缓存陈旧：provider 切换前显式 ros2 daemon stop/start，再列节点。
+
+  · v14.0 验证标准：
+    - /vlm/status 收到 {"type":"provider_switched","provider":"internvl_local","ready":true}。
+    - 前端 VideoView 徽章从“云端·通义千问VL”切到“本地轻量VLM”或“本地离线（规则兜底）”。
+    - /vlm/scene_description 日志出现 provider=internvl_local，断网期不再出现 Qwen 网络错误。
+    - curl -m 3 https://dashscope.aliyuncs.com/ 断网期超时，恢复后 200。
+    - Nav2 收到动态障碍时 /vlm/safety_event 出现 {"action":"reroute"|"stop", ...}，前端出现红点与“重规划 N 次”。
+
 
 ─────────────────────────────────────────────────────────────────────────────
 
@@ -623,7 +678,7 @@ v13.0 (2026-06-30) — 火灾/烟雾识别情景接入（YOLOv5 一阶筛查 + Q
 零、当前真实状态
 ================================================================================
 
-  已具备 (v13.0):
+  已具备 (v14.0):
     - FastAPI + Vue3 Web 上位机框架（可运行，局域网浏览器可访问）
     - 8 个可视化页面（监控/视频/激光/IMU/控制/SLAM/导航/设备），VLM 场景理解嵌入视频监控页
     - 模拟数据生成器（mock_data.py），仿真了全部传感器数据
@@ -650,6 +705,15 @@ v13.0 (2026-06-30) — 火灾/烟雾识别情景接入（YOLOv5 一阶筛查 + Q
     - ✅ 后端火警接入：config.py fire topic 配置、ros2_bridge 订阅 /alert/fire、data_pusher.push_fire_alert()、websocket_manager fire_alert 默认订阅
     - ✅ 前端全局火警 UI：useFireAlert 单例、FireAlertOverlay 顶部横幅/右下角 toast/详情弹窗/Web Audio 警报音、App.vue 根挂载
     - ✅ 火警联调文档：FIRE_SMOKE_GUIDE.md 覆盖启动顺序、测试步骤、报错表、调参表、关键文件和一键关停
+    - ✅ 本地离线 VLM provider（v14.0）：internvl_local 支持 HF 本地模型加载，模型不可用时 rule_based 兜底，断网不请求公网
+    - ✅ provider 热切换（v14.0）：vlm_node 参数回调重建 self._provider，并通过 /vlm/status 发布 provider_switched
+    - ✅ /vlm/ask 修复（v14.0）：后端通过 /vlm_scene_node/set_parameters 写 next_user_prompt，再触发 ask
+    - ✅ 动态行人障碍节点（v14.0）：dynamic_person_obstacle_node 发布 /dynamic_person_points 与 /vlm/safety_event
+    - ✅ Nav2 动态障碍接入（v14.0）：local/global costmap 增加 dynamic_person observation source，行人点云进入代价地图
+    - ✅ 安全事件 WebSocket（v14.0）：safety_event、dynamic_person_points、vlm_status 后端订阅解析与定周期推送
+    - ✅ 前端创新点展示（v14.0）：本地/云端 VLM 徽章、动态障碍红点、重规划计数、安全动作徽章、SafetyEventOverlay
+    - ✅ 断网/恢复演示脚本（v14.0）：scripts/demo_offline.sh 与 scripts/demo_recover.sh，处理 sudo 环境、DDS 用户隔离和 ros2 daemon 缓存
+    - ✅ 创新点演示手册：INNOVATION_DEMO.md 覆盖启动顺序、验证清单、FAQ 与口播稿
     - ✅ 视频推送三级降级（ros2_annotated → ros2 → mock），annotated_image 优先 WebSocket 推送
     - ✅ YOLO 检测修复：NMS 后处理 + 变量名拼写修正
     - ✅ BPU 检测节点（detection_node_bpu.py）：hbm_runtime 推理 + 变量名冲突修复
@@ -696,7 +760,7 @@ v13.0 (2026-06-30) — 火灾/烟雾识别情景接入（YOLOv5 一阶筛查 + Q
     - Yaw 角绝对定向（IMU 互补滤波无磁力计修正，长时间漂移）
     - 稳定可靠的 Nav2 实车导航终验（链路已接入，但短距离目标、到点稳定性、costmap 误报仍需现场调参）
     - BPU 端侧推理加速（当前 yolov5s GPU 模型已就绪，待换 horizon_nnie 量化模型部署到 BPU）
-    - 本地离线 VLM 推理（internvl_local 目前为 BPU 占位，当前主路径仍是 Qwen-VL API）
+    - 本地 VLM 加速推理终验（internvl_local 已可离线兜底，后续可接 vLLM/TensorRT-LLM/BPU 量化模型提升速度）
 
   核心目标: 从"纯模拟 Web UI" 逐步演进到"真实硬件+真实算法+AI 能力"的完整系统
 
@@ -941,13 +1005,13 @@ v13.0 (2026-06-30) — 火灾/烟雾识别情景接入（YOLOv5 一阶筛查 + Q
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ M10-VLM  场景理解（VLM + Qwen-VL）✅ 已完成 (v12.0)                            │
+│ M10-VLM  场景理解（VLM + Qwen-VL / 本地轻量 VLM）✅ 已完成 (v14.0)              │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 优先级: ★★★★★  难度: ★★★★  依赖: M04-HW, M09  |  状态: ✅ 已完成               │
 │                                                                             │
 │ 实现方案:                                                                     │
 │   [启动] ros2 launch vlm_scene vlm.launch.py                                 │
-│          provider 默认 qwen_vl，可切换 openai_vision / deepseek_text / mock   │
+│          provider 默认 qwen_vl，可切换 openai_vision / internvl_local / mock  │
 │   [输入] /camera/camera/color/image_raw + /detection/results                  │
 │   [节流] cooldown=3s，heartbeat=20s，distance_threshold=0.5m                  │
 │   [输出] /vlm/scene_description（std_msgs/String，JSON 场景描述）              │
@@ -955,9 +1019,11 @@ v13.0 (2026-06-30) — 火灾/烟雾识别情景接入（YOLOv5 一阶筛查 + Q
 │          /vlm/ask（std_srvs/Trigger，手动触发一次分析）                        │
 │                                                                             │
 │ 数据流:                                                                       │
-│   D435i → d435i_detection → vlm_node → Qwen-VL API                            │
+│   D435i → d435i_detection → vlm_node → qwen_vl / internvl_local               │
 │        → /vlm/scene_description → ros2_bridge → data_pusher                   │
 │        → WebSocket(vlm_description/vlm_status) → VideoView.vue 场景理解面板    │
+│   断网演示: sudo bash scripts/demo_offline.sh → provider=internvl_local        │
+│   恢复演示: sudo bash scripts/demo_recover.sh → provider=qwen_vl               │
 │                                                                             │
 │ ROS2 包结构 (ros2_ws/src/vlm_scene/):                                         │
 │   - vlm_node.py — 主节点，订阅图像/检测，发布描述/状态，提供手动 ask service      │
@@ -965,20 +1031,21 @@ v13.0 (2026-06-30) — 火灾/烟雾识别情景接入（YOLOv5 一阶筛查 + Q
 │   - utils/keyframe.py — 关键帧选择器，控制调用频率与变化触发                     │
 │   - providers/base.py / factory.py — provider 插件接口与工厂                    │
 │   - providers/keys.py — API Key/模型名/BASE_URL 集中管理                       │
-│   - providers/qwen_vl.py / openai_vision.py / deepseek_text.py / mock.py       │
+│   - providers/qwen_vl.py / openai_vision.py / internvl_local.py / mock.py      │
 │                                                                             │
 │ 后端/前端:                                                                    │
 │   - backend/app/api/vlm.py 提供 status/latest/history/ask                      │
 │   - ros2_bridge.py 订阅 /vlm/* 并支持 call_vlm_ask()                           │
+│   - /vlm/ask 先写 /vlm_scene_node/set_parameters(next_user_prompt) 再触发分析   │
 │   - data_pusher.py 以 0.5s/1.0s 推送描述与状态                                  │
-│   - VideoView.vue 嵌入“场景理解”块，删除独立 /vlm 路由                           │
+│   - VideoView.vue 嵌入“场景理解”块，显示云端/本地 provider 徽章                  │
 │                                                                             │
 │ 部署注意:                                                                     │
 │   - ROS2 路径为 /opt/ros/humble；板端首次安装 ros-humble-std-srvs              │
 │   - backend/venv 内安装 opencv-python-headless==4.8.1.78 和 numpy             │
 │   - 前端需本地 npm run build 后再 deploy.sh，板端不会重新构建前端                │
 │                                                                             │
-│ 验证标准: /#/video 页面“场景理解”区域能显示 ready 状态、手动分析结果和历史记录     │
+│ 验证标准: /#/video 页面能显示 ready 状态、provider 徽章、手动分析结果和历史记录   │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────┐

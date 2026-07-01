@@ -42,6 +42,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 try:
@@ -113,6 +114,24 @@ class VLMSceneNode(Node):
         # 网络
         self.declare_parameter("timeout_sec",          20.0)
 
+        # ── 本地轻量化 VLM（internvl_local provider）参数 ────────────────────
+        # 这几个参数由 vlm.launch.py 透传，或直接在 vlm_params.yaml 里覆盖。
+        # 未声明会导致 launch 传入时抛 ParameterNotDeclaredException，因此这里
+        # 全部预先声明；具体读取由 providers/internvl_local.py 通过 env 完成，
+        # 节点这一层只负责把 launch 参数写回同名 env（下方 provider 实例化前）。
+        self.declare_parameter("local_model_path",     "")
+        self.declare_parameter("local_model_type",     "auto")
+        self.declare_parameter("local_device",         "auto")
+        self.declare_parameter("local_dtype",          "float16")
+        self.declare_parameter("local_max_new_tokens", 128)
+        self.declare_parameter("local_max_image_side", 448)
+        self.declare_parameter("local_stop_distance_m",    0.8)
+        self.declare_parameter("local_reroute_distance_m", 2.5)
+
+        # /vlm/ask service 由后端 backend 通过 SetParameters 写入本参数触发定制 prompt。
+        # 必须先声明才能被外部 set_parameters 写入。
+        self.declare_parameter("next_user_prompt",     "")
+
         # ── 火警二次确认 ────────────────────────────────────────────────────
         # 订阅 fire_smoke_node 发的 /fire_smoke/prealert
         self.declare_parameter("sub_topic_fire_prealert", "/fire_smoke/prealert")
@@ -157,8 +176,45 @@ class VLMSceneNode(Node):
         self._fire_with_image   = bool(self.get_parameter("fire_alert_include_image").value)
 
         # ------------------------------------------------------------------
+        # 把 launch 传进来的 local_* 参数写回环境变量，供 internvl_local provider 读取
+        # （provider 自身也支持从 env 读取，这里做二次兜底，让 launch 优先级最高）
+        # ------------------------------------------------------------------
+        _lp = self.get_parameter("local_model_path").value or ""
+        if _lp:
+            os.environ["VLM_LOCAL_MODEL_PATH"] = _lp
+            # 兼容旧变量名
+            os.environ.setdefault("VLM_INTERNVL_MODEL_PATH", _lp)
+        _lt = self.get_parameter("local_model_type").value or "auto"
+        os.environ["VLM_LOCAL_MODEL_TYPE"] = _lt
+        _ldev = self.get_parameter("local_device").value or "auto"
+        os.environ["VLM_LOCAL_DEVICE"] = _ldev
+        _ldt = self.get_parameter("local_dtype").value or "float16"
+        os.environ["VLM_LOCAL_DTYPE"] = _ldt
+        try:
+            _lmnt = int(self.get_parameter("local_max_new_tokens").value)
+            os.environ["VLM_LOCAL_MAX_NEW_TOKENS"] = str(_lmnt)
+        except Exception:
+            pass
+
+        # 本地 VLM 场景描述节流距离（rule-based fallback / provider 读取）
+        try:
+            os.environ["VLM_LOCAL_STOP_DISTANCE_M"] = str(
+                float(self.get_parameter("local_stop_distance_m").value)
+            )
+            os.environ["VLM_LOCAL_REROUTE_DISTANCE_M"] = str(
+                float(self.get_parameter("local_reroute_distance_m").value)
+            )
+            os.environ["VLM_LOCAL_MAX_IMAGE_SIDE"] = str(
+                int(self.get_parameter("local_max_image_side").value)
+            )
+        except Exception:
+            pass
+
+        # ------------------------------------------------------------------
         # 实例化 Provider
         # ------------------------------------------------------------------
+        # provider 实例锁：保护 __init__ / 参数变更回调 / 推理线程之间的 self._provider 切换
+        self._provider_lock = threading.Lock()
         provider_kwargs = dict(
             model=self.model_name or None,
             timeout=self._timeout,
@@ -259,6 +315,113 @@ class VLMSceneNode(Node):
             "sub": {"rgb": self._sub_rgb_topic, "detection": self._sub_det_topic},
             "pub": {"description": self._pub_desc_topic, "status": self._pub_status_topic},
         })
+
+        # ------------------------------------------------------------------
+        # 参数变更回调：让 `ros2 param set /vlm_scene_node provider xxx` 能真正生效
+        # ------------------------------------------------------------------
+        # 说明：ROS 2 的 param set 只会更新参数值本身，不会重跑 __init__。
+        # demo_offline.sh / demo_recover.sh 是通过 `ros2 param set` 切 provider 的，
+        # 如果这里不注册回调，节点会一直用启动时创建的那个 provider 实例（比如 qwen_vl），
+        # 断网时就永远走云端并报 [Errno 101] Network is unreachable。
+        self.add_on_set_parameters_callback(self._on_params_changed)
+
+    # ----------------------------------------------------------------------
+    # 参数变更回调
+    # ----------------------------------------------------------------------
+    def _on_params_changed(self, params) -> SetParametersResult:
+        """接收 provider / model 等运行时参数变更，动态重建 self._provider。"""
+        # 只关注 provider / model 两个参数；其它参数放行（返回 successful=True 即可）
+        new_provider = None
+        new_model = None
+        for p in params:
+            if p.name == "provider":
+                try:
+                    v = str(p.value or "").strip()
+                except Exception:
+                    v = ""
+                if v:
+                    new_provider = v
+            elif p.name == "model":
+                try:
+                    new_model = str(p.value or "")
+                except Exception:
+                    new_model = ""
+
+        if new_provider is None and new_model is None:
+            return SetParametersResult(successful=True)
+
+        target_provider = new_provider or self.provider_name
+        target_model = new_model if new_model is not None else self.model_name
+
+        # 与当前完全一致就不重建，避免 healthcheck 抖动
+        cur_name = ""
+        cur_model = ""
+        try:
+            cur_name = self._provider.name
+            cur_model = self._provider.model or ""
+        except Exception:
+            pass
+        if target_provider == cur_name and (target_model or "") == (cur_model or ""):
+            self.get_logger().info(
+                f"[VLM] 参数无变化 provider={target_provider} model={target_model or '-'}，跳过重建"
+            )
+            return SetParametersResult(successful=True)
+
+        self.get_logger().warn(
+            f"[VLM] 参数变更 provider: {cur_name} → {target_provider}，"
+            f"model: {cur_model or '-'} → {target_model or '-'}，正在重建 provider..."
+        )
+
+        try:
+            new_kwargs = dict(
+                model=target_model or None,
+                timeout=self._timeout,
+                max_image_side=self._max_side,
+            )
+            new_inst = create_provider(target_provider, **new_kwargs)
+            new_ready = False
+            try:
+                new_ready = bool(new_inst.healthcheck())
+            except Exception as e:
+                self.get_logger().warn(f"[VLM] 新 provider healthcheck 失败: {e}")
+
+            # 切实例（拿锁，避免和 _tick_once / _run_fire_alert 竞争）
+            old = None
+            with self._provider_lock:
+                old = self._provider
+                self._provider = new_inst
+                self._provider_ready = new_ready
+                self.provider_name = target_provider
+                self.model_name = target_model
+
+            # 优雅关闭旧实例（不在锁内做，避免占锁太久）
+            if old is not None and old is not new_inst:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+
+            self.get_logger().info(
+                f"[VLM] provider 已切换 → name={new_inst.name} model={new_inst.model} "
+                f"ready={new_ready}"
+            )
+            # 广播新的 /vlm/status，前端徽章会立刻更新
+            self._publish_status({
+                "type": "provider_switched",
+                "provider": new_inst.name,
+                "model": new_inst.model,
+                "ready": new_ready,
+                "providers_available": list_providers(),
+            })
+            return SetParametersResult(successful=True)
+
+        except Exception as e:
+            self.get_logger().error(f"[VLM] 参数变更处理失败: {e}")
+            # 返回 successful=False 会让 param set 报错，方便脚本感知
+            return SetParametersResult(
+                successful=False,
+                reason=f"rebuild provider failed: {e}",
+            )
 
     # ----------------------------------------------------------------------
     # 订阅回调（在 ROS spin 线程中执行，必须很快返回）
@@ -362,14 +525,20 @@ class VLMSceneNode(Node):
             timestamp=ts,
         )
 
+        # 拿 provider 快照（锁内），随后释放锁再做真正的网络/模型推理，
+        # 这样即便 describe 花几秒钟，也不会阻塞参数变更回调。
+        with self._provider_lock:
+            provider_ref = self._provider
+            provider_name_snapshot = provider_ref.name
+
         self.get_logger().info(
             f"[VLM] 触发推理 reason={decision.reason} dets={len(dets)} "
-            f"frame={frame_id} provider={self._provider.name}"
+            f"frame={frame_id} provider={provider_name_snapshot}"
         )
 
         t0 = time.time()
         try:
-            resp = self._provider.describe(req)
+            resp = provider_ref.describe(req)
         except Exception as e:
             self.get_logger().error(f"[VLM] provider 异常: {e}")
             self._publish_status({"type": "error", "error": str(e)})
@@ -381,8 +550,8 @@ class VLMSceneNode(Node):
             "timestamp":   time.time(),
             "frame_id":    frame_id,
             "trigger":     decision.reason,
-            "provider":    resp.provider or self._provider.name,
-            "model":       resp.model or self._provider.model,
+            "provider":    resp.provider or provider_ref.name,
+            "model":       resp.model or provider_ref.model,
             "description": resp.description,
             "per_object":  resp.per_object,
             "elapsed_ms":  round(resp.elapsed_ms or elapsed, 1),
@@ -405,7 +574,7 @@ class VLMSceneNode(Node):
         self._publish_status({
             "type": "infer_ok",
             "elapsed_ms": round(elapsed, 1),
-            "provider": self._provider.name,
+            "provider": provider_ref.name,
             "trigger": decision.reason,
         })
 
@@ -455,7 +624,11 @@ class VLMSceneNode(Node):
     def _run_fire_alert(self, bgr: np.ndarray, prealert: dict,
                         frame_id: int, ts: float) -> None:
         """对 prealert 做一次 VLM 二次确认，并把结构化结果发布到 /alert/fire。"""
-        if not self._provider_ready:
+        # 拿 provider 快照（锁内），后续网络调用不占锁
+        with self._provider_lock:
+            provider_ref = self._provider
+            provider_ready = self._provider_ready
+        if not provider_ready:
             self.get_logger().warn("[FIRE] provider 未就绪，跳过二次确认")
             return
 
@@ -489,12 +662,12 @@ class VLMSceneNode(Node):
         )
 
         self.get_logger().warn(
-            f"[FIRE] 调 VLM 二次确认 provider={self._provider.name} "
+            f"[FIRE] 调 VLM 二次确认 provider={provider_ref.name} "
             f"boxes={len(fake_dets)} frame={frame_id}"
         )
         t0 = time.time()
         try:
-            resp = self._provider.describe(req)
+            resp = provider_ref.describe(req)
         except Exception as e:
             self.get_logger().error(f"[FIRE] VLM 异常: {e}")
             self._publish_status({"type": "fire_error", "error": str(e)})
@@ -516,8 +689,8 @@ class VLMSceneNode(Node):
             "reason":         str(parsed.get("reason", "") or ""),
             "recommendation": str(parsed.get("recommendation", "") or ""),
             "raw":            resp.description or "",
-            "provider":       resp.provider or self._provider.name,
-            "model":          resp.model or self._provider.model,
+            "provider":       resp.provider or provider_ref.name,
+            "model":          resp.model or provider_ref.model,
             "elapsed_ms":     round(resp.elapsed_ms or elapsed, 1),
             "prealert":       prealert,
         }

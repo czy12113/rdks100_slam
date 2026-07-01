@@ -52,6 +52,21 @@
     # ── 网络 ──────────────────────────────────────────────────────────────────
     timeout_sec: 20.0
 
+    # ── 本地轻量化 VLM（internvl_local provider）────────────────────────────
+    # 本地推理不消耗公网，比赛现场 curl 千问 API 超时也不影响 VLM 输出。
+    # 有 HF 格式的 Qwen2-VL-2B / MiniCPM-V / InternVL2-2B 模型时走真实推理，
+    # 无模型时自动降级为规则兜底，仍输出同样的 JSON schema。
+    # 环境变量：
+    #   VLM_LOCAL_MODEL_PATH  HF 模型目录（含 config.json）
+    #   VLM_LOCAL_MODEL_TYPE  auto / qwen2_vl / minicpmv / internvl
+    #   VLM_LOCAL_DEVICE      cpu / cuda / auto
+    #   VLM_LOCAL_DTYPE       float16 / bfloat16 / float32
+    #   VLM_LOCAL_MAX_NEW_TOKENS 生成上限，默认 128（快 + 输出 JSON 足够）
+    # 本节点参数：
+    local_max_image_side: 448
+    local_stop_distance_m: 0.8
+    local_reroute_distance_m: 2.5
+
     # ── 火警二次确认（与 fire_smoke_node 配套） ───────────────────────────────
     # fire_smoke_node 用 YOLOv5 做一阶火/烟检测，触发后发 /fire_smoke/prealert，
     # 本节点再调一次 VLM 做严格 JSON 二次确认，最终发布到 /alert/fire。

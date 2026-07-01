@@ -12,11 +12,37 @@
 | IMU 姿态 | Three.js 3D 姿态展示、加速度(g)/角速度(rad/s)曲线、互补滤波姿态解算（v5.0 真实接入） |
 | 机器人控制 | 虚拟摇杆、WASD 键盘、长按/点按双模式、速度调节、急停、里程计实时显示（v9.0 SafetyGate + 多层安全停车） |
 | 目标检测 | YOLOv5 目标检测 + D435i 深度测距，带框+距离标注视频推送（v6.0 新增） |
-| 场景理解 | VLM 视觉语言场景理解：D435i 关键帧 + 检测框 → Qwen-VL → 自然语言描述（v12.0 新增） |
-| 火灾/烟雾告警 | YOLOv5 火/烟一阶筛查 + Qwen-VL 二次确认 + 全局前端横幅/弹窗/警报音（v13.0 新增） |
+| 场景理解 | VLM 视觉语言场景理解：D435i 关键帧 + 检测框 → Qwen-VL / internvl_local → 自然语言描述与语义决策（v14.0 支持云端/本地切换） |
+| 火灾/烟雾告警 | YOLOv5 火/烟一阶筛查 + VLM 二次确认 + 全局前端横幅/弹窗/警报音（v13.0 新增，v14.0 支持断网本地兜底） |
 | SLAM 建图 | Cartographer 2D/3D 建图（v7.0 真实接入 + v9.0 重影二次优化）、占据栅格地图、轨迹、地图保存/加载 |
-| 导航规划 | Nav2 实车导航链路接入（v10.0，SmacPlanner2D + MPPI Ackermann，联调未完全成功） |
+| 导航规划 | Nav2 实车导航链路接入（SmacPlanner2D + MPPI Ackermann），v14.0 新增动态行人障碍点云、安全事件与前端重规划展示 |
 | 设备管理 | 设备信息、传感器状态、参数配置 |
+
+## v14.0 更新摘要
+
+v14.0 补齐“VLM+Nav2 离线韧性”创新点：`vlm_scene` 增加 `internvl_local` 本地轻量 VLM provider，公网断开时可通过脚本切到本地模型或规则兜底；`dynamic_person_obstacle_node` 把 YOLO 检测到的行人投影为 `/dynamic_person_points` 供 Nav2 costmap 使用，并发布 `/vlm/safety_event` 给前端显示 stop/reroute/clear；公网恢复后 `demo_recover.sh` 可切回 `qwen_vl` 云端 provider。
+
+创新点链路：
+
+```
+D435i + YOLO 检测
+  → vlm_node provider=qwen_vl / internvl_local
+  → /vlm/scene_description + /vlm/status
+  → dynamic_person_obstacle_node
+  → /dynamic_person_points（Nav2 costmap 动态障碍）
+  → /vlm/safety_event（stop / reroute / clear）
+  → backend WebSocket safety_event + dynamic_person_points
+  → VideoView 云端/本地徽章 + NavigationView 红点/重规划次数/安全动作
+```
+
+断网/恢复演示：
+
+```bash
+sudo bash scripts/demo_offline.sh    # 云端·通义千问VL → 本地轻量VLM / 本地规则兜底
+sudo bash scripts/demo_recover.sh    # 本地 → 云端·通义千问VL
+```
+
+验收重点：`/vlm/status` 出现 `provider_switched` 且 `provider=internvl_local`；断网期间 `/vlm/scene_description` 不再出现 Qwen 网络错误；动态行人触发时 `/vlm/safety_event` 出现 `reroute` 或 `stop`，前端导航页出现红点与“重规划 N 次”。完整口播和 FAQ 见 [INNOVATION_DEMO.md](INNOVATION_DEMO.md)。
 
 ## v13.0 更新摘要
 
@@ -103,7 +129,7 @@ rdks100_slam/
 │   │       ├── control.py    # 速度控制（线速度+角速度双斜坡加速度限幅）
 │   │       ├── slam.py
 │   │       ├── navigation.py
-│   │       ├── vlm.py        # VLM 状态/最新结果/历史/手动 ask API（v12.0）
+│   │       ├── vlm.py        # VLM 状态/最新结果/历史/手动 ask API（v12.0，v14.0 修复 set_parameters）
 │   │       └── device.py
 │   ├── main.py
 │   ├── requirements.txt
@@ -113,8 +139,11 @@ rdks100_slam/
 │   │   ├── config/index.ts   # 前端宏定义
 │   │   ├── views/            # 各功能页面
 │   │   ├── stores/robot.ts   # Pinia 全局状态
+│   │   ├── composables/useVlmProvider.ts    # 云端/本地 VLM provider 徽章状态（v14.0）
+│   │   ├── composables/useSafetyEvent.ts    # 动态行人安全事件状态（v14.0）
 │   │   ├── composables/useFireAlert.ts      # 火警全局单例状态 + Web Audio 警报音（v13.0）
 │   │   ├── components/FireAlertOverlay.vue  # 火警全局横幅/toast/弹窗 UI（v13.0）
+│   │   ├── components/SafetyEventOverlay.vue # 动态行人 stop/reroute 全局提示（v14.0）
 │   │   └── api/              # HTTP + WebSocket 封装
 │   └── package.json
 ├── ros2_ws/                  # ROS2 工作空间（统一管理所有 ROS2 包）
@@ -129,7 +158,7 @@ rdks100_slam/
 │       │   ├── config/fire_smoke_params.yaml      # 火/烟检测参数（v13.0）
 │       │   ├── launch/detection.launch.py          # 一键启动相机+检测
 │       │   └── launch/fire_smoke.launch.py         # 火/烟检测启动（v13.0）
-│       ├── vlm_scene/             # VLM 场景理解（v12.0 新增，Qwen-VL/OpenAI/mock provider）
+│       ├── vlm_scene/             # VLM 场景理解（Qwen-VL/OpenAI/internvl_local/mock provider）
 │       │   ├── vlm_scene/vlm_node.py
 │       │   ├── vlm_scene/providers/
 │       │   ├── vlm_scene/utils/
@@ -138,7 +167,8 @@ rdks100_slam/
 │       ├── czybot_navigation2/    # 机器人运动控制/Nav2（STM32 串口桥接 + 阿克曼导航参数）
 │       │   └── scripts/
 │       │       ├── stm32_bridge.py           # STM32 串口桥接节点（v9.0 限速/急停/watchdog）
-│       │       └── ackermann_teleop_key.py   # 终端键盘遥控（select 非阻塞读取）
+│       │       ├── ackermann_teleop_key.py   # 终端键盘遥控（select 非阻塞读取）
+│       │       └── dynamic_person_obstacle_node.py # 动态行人障碍 + 安全事件（v14.0）
 │       └── czybot_slam/           # Cartographer SLAM 建图（v7.0 新增）
 │           ├── launch/                        # 3 种启动文件（2D/3D/slam_toolbox）
 │           │   ├── cartographer_2d_slam.launch.py
@@ -160,6 +190,10 @@ rdks100_slam/
 ├── MID360S_RVIZ_SETUP.md     # Livox Mid-360S RViz2 远程可视化配置指南
 ├── LIVOX_MID360_MIGRATION.md # LD14P → Mid-360S 迁移方案
 ├── FIRE_SMOKE_GUIDE.md       # 火灾/烟雾识别链路上手指南（v13.0）
+├── INNOVATION_DEMO.md        # VLM+Nav2 创新点演示手册（v14.0）
+├── scripts/
+│   ├── demo_offline.sh       # 断网并切换 internvl_local（v14.0）
+│   └── demo_recover.sh       # 恢复公网并切回 qwen_vl（v14.0）
 ├── MODULE_PLAN.txt           # 模块化迭代演进方案
 ├── start.sh                  # 一键启动脚本
 └── README.md
@@ -497,7 +531,7 @@ ros2 launch d435i_detection detection.launch.py camera:=false
 > **说明**：yolov5s CPU 推理 ~2FPS。发布 `/detection/results`（JSON）和 `/detection/annotated_image`（BGR8 带框+距离）。
 > 后端 `data_pusher.push_video()` 三级降级：ros2_annotated → ros2 → mock。
 
-### VLM 场景理解（v12.0 新增）
+### VLM 场景理解（v14.0 云端/本地切换）
 
 相机和检测节点启动后，启动 VLM 节点：
 
@@ -509,14 +543,15 @@ source install/setup.bash
 # 默认 provider=qwen_vl，调用 DashScope OpenAI 兼容接口
 ros2 launch vlm_scene vlm.launch.py
 
-# 离线联调前端时可切到 mock provider
-ros2 launch vlm_scene vlm.launch.py provider:=mock
+# 本地轻量 VLM；local_model_path 留空时自动走规则兜底，不请求公网
+ros2 launch vlm_scene vlm.launch.py provider:=internvl_local \
+  local_model_path:=/home/sunrise/models/InternVL2-2B
 
 # 手动触发一次分析
 ros2 service call /vlm/ask std_srvs/srv/Trigger {}
 ```
 
-> **说明**：VLM 节点发布 `/vlm/scene_description` 和 `/vlm/status`，前端在 `/#/video` 的“场景理解”区域展示最新描述、状态和历史记录。
+> **说明**：VLM 节点发布 `/vlm/scene_description` 和 `/vlm/status`，前端在 `/#/video` 的“场景理解”区域展示最新描述、状态、历史记录和云端/本地 provider 徽章。`demo_offline.sh` / `demo_recover.sh` 通过 `/vlm_scene_node/set_parameters` 切换 provider。
 
 ### 火灾/烟雾检测告警（v13.0 新增）
 
@@ -703,9 +738,9 @@ ros2 launch d435i_bringup d435i_camera.launch.py
 ros2 launch d435i_detection detection.launch.py camera:=false
 ```
 
-## VLM 场景理解（v12.0 新增）
+## VLM 场景理解（v14.0 云端/本地双 provider）
 
-`vlm_scene` 功能包把 D435i RGB 关键帧与 YOLO/DOSOD 检测结果送入视觉语言模型，输出适合前端展示或后续 TTS 播报的自然语言场景描述。v13.0 起同一节点也订阅 `/fire_smoke/prealert`，用于火警场景的 Qwen-VL 二次确认并发布 `/alert/fire`。
+`vlm_scene` 功能包把 D435i RGB 关键帧与 YOLO/DOSOD 检测结果送入视觉语言模型，输出适合前端展示、Nav2 安全决策或后续 TTS 播报的自然语言/结构化场景描述。v13.0 起同一节点也订阅 `/fire_smoke/prealert`，用于火警场景的 VLM 二次确认并发布 `/alert/fire`。v14.0 起 provider 可在 `qwen_vl` 云端和 `internvl_local` 本地轻量模型之间运行时切换。
 
 ### 数据流
 
@@ -713,10 +748,18 @@ ros2 launch d435i_detection detection.launch.py camera:=false
 /camera/camera/color/image_raw
   + /detection/results
     → vlm_node（关键帧节流：冷却 3s + 心跳 20s + 距离变化 0.5m）
-      → provider（qwen_vl / openai_vision / deepseek_text / internvl_local / mock）
+      → provider（qwen_vl / openai_vision / internvl_local / mock）
         → /vlm/scene_description + /vlm/status
           → ros2_bridge → data_pusher → WebSocket
             → VideoView.vue「场景理解」面板
+            → useVlmProvider 云端/本地徽章
+
+/detection/results + /odom + /vlm/scene_description
+  → dynamic_person_obstacle_node
+    → /dynamic_person_points（PointCloud2，Nav2 costmap observation source）
+    → /vlm/safety_event（JSON: clear / reroute / stop）
+      → ros2_bridge → data_pusher → WebSocket
+        → NavigationView 动态红点/重规划计数 + SafetyEventOverlay
 
 /fire_smoke/prealert
   → vlm_node（火警二次确认：fire_alert_cooldown_sec + 严格 JSON）
@@ -746,7 +789,6 @@ ros2_ws/src/vlm_scene/
         ├── keys.py
         ├── qwen_vl.py
         ├── openai_vision.py
-        ├── deepseek_text.py
         ├── internvl_local.py
         └── mock.py
 ```
@@ -757,21 +799,27 @@ ros2_ws/src/vlm_scene/
 - 图像解码由 `image_ops.py` 手写完成，不依赖 `cv_bridge`。
 - 检测数据格式与 `d435i_detection` 对齐：`class_id`、`class_name`、`confidence`、`bbox/x1y1x2y2`、`distance_m`。
 - provider 统一实现 `describe(VLMRequest) -> VLMResponse`，节点只通过 `create_provider()` 创建实例。
-- API Key 与模型名集中在 `providers/keys.py`，读取优先级为环境变量 > 文件常量 > fallback。
-- `vlm_node` 启动时只发布一次 ready 状态，后续在关键帧触发或手动 `/vlm/ask` 时更新描述。
+- API Key 与模型名集中在 `providers/keys.py`，读取优先级为函数 kwargs > 环境变量 > 文件常量 > fallback。
+- `internvl_local.py` 支持 Qwen2-VL / MiniCPM-V / InternVL / AutoVision2Seq 的 HF 通用加载；本地模型不可用时走 `_rule_based_infer`，只用检测框和距离生成 `scene/risk/reason/suggestion` JSON。
+- `vlm_node` 注册参数变更回调；外部把 `provider` 设置为 `internvl_local` 或 `qwen_vl` 后，会重建 provider 实例并发布 `/vlm/status` 的 `provider_switched` 事件。
+- `vlm_node` 启动时发布 ready 状态，关键帧触发、手动 `/vlm/ask`、provider 切换或状态变化时更新描述/状态。
 
 ### 后端与前端接入
 
 - `backend/app/core/config.py` 新增 `ROS2_TOPIC_VLM_DESCRIPTION`、`ROS2_TOPIC_VLM_STATUS`、`ROS2_SERVICE_VLM_ASK`。
 - v13.0 新增 `ROS2_TOPIC_FIRE_ALERT`、`ROS2_TOPIC_FIRE_PREALERT`、`ROS2_TOPIC_FIRE_RESULTS`，分别对应 `/alert/fire`、`/fire_smoke/prealert`、`/fire_smoke/results`。
+- v14.0 新增 `ROS2_TOPIC_SAFETY_EVENT`、`ROS2_TOPIC_DYNAMIC_PERSON_POINTS`，分别对应 `/vlm/safety_event`、`/dynamic_person_points`。
 - `backend/app/services/ros2_bridge.py` 新增 VLM topic 订阅、状态/描述解析和 `call_vlm_ask()` service client。
+- `backend/app/services/ros2_bridge.py` v14.0 修复 `/api/vlm/ask`：先调用 `/vlm_scene_node/set_parameters` 写入 `next_user_prompt`，再触发 `/vlm/ask`。
 - `backend/app/services/ros2_bridge.py` v13.0 新增 fire_alert 订阅和 `_parse_fire_alert()`，把 `/alert/fire` 的 JSON 规范化后缓存。
-- `backend/app/services/data_pusher.py` 新增 `push_vlm_description()`、`push_vlm_status()` 与 v13.0 `push_fire_alert()`。
-- `backend/app/core/websocket_manager.py` 新增 `vlm_description`、`vlm_status` 与 v13.0 `fire_alert` topic，其中 `fire_alert` 属于默认订阅。
+- `backend/app/services/ros2_bridge.py` v14.0 新增 safety_event 与 dynamic_person_points 订阅解析。
+- `backend/app/services/data_pusher.py` 新增 `push_vlm_description()`、`push_vlm_status()`、v13.0 `push_fire_alert()`、v14.0 `push_safety_event()` 和 `push_dynamic_person_points()`。
+- `backend/app/core/websocket_manager.py` 新增 `vlm_description`、`vlm_status`、v13.0 `fire_alert`、v14.0 `safety_event` 与 `dynamic_person_points` topic，其中 `fire_alert` 和 `safety_event` 属于默认订阅。
 - `backend/app/api/vlm.py` 提供 `GET /api/vlm/status`、`GET /api/vlm/latest`、`GET /api/vlm/history?limit=20`、`POST /api/vlm/ask`。
-- `frontend/src/views/video/VideoView.vue` 在视频监控页嵌入“场景理解”区域，包含状态 tag、立即分析按钮、描述卡片、手动 prompt 和历史折叠面板。
+- `frontend/src/views/video/VideoView.vue` 在视频监控页嵌入“场景理解”区域，包含状态 tag、云端/本地徽章、立即分析按钮、描述卡片、手动 prompt 和历史折叠面板。
 - v13.0 新增 `frontend/src/composables/useFireAlert.ts`、`frontend/src/components/FireAlertOverlay.vue`，并在 `App.vue` 根节点挂载全局告警 UI。
-- `frontend/src/api/websocket.ts` 将 `fire_alert` 加入 `AUTO_SUBSCRIBED_TOPICS`，与后端 `DEFAULT_TOPICS` 对齐。
+- v14.0 新增 `frontend/src/composables/useVlmProvider.ts`、`frontend/src/composables/useSafetyEvent.ts`、`frontend/src/components/SafetyEventOverlay.vue`；`NavigationView.vue` 显示动态障碍红点、最近距离、重规划次数和安全动作。
+- `frontend/src/api/websocket.ts` 将 `fire_alert` 和 `safety_event` 加入 `AUTO_SUBSCRIBED_TOPICS`，与后端 `DEFAULT_TOPICS` 对齐。
 - 独立 `/vlm` 路由已删除，`vlm_description` 按需订阅，`vlm_status` 默认自动订阅。
 
 ### 板端部署
@@ -802,6 +850,10 @@ ros2 topic echo /vlm/status --once
 ros2 topic echo /vlm/scene_description --once
 ros2 service call /vlm/ask std_srvs/srv/Trigger {}
 curl http://10.21.1.145:8000/api/vlm/status
+
+# 断网/恢复演示
+sudo bash /home/sunrise/rdks100_slam/scripts/demo_offline.sh
+sudo bash /home/sunrise/rdks100_slam/scripts/demo_recover.sh
 ```
 
 火警链路验证：
@@ -810,6 +862,13 @@ curl http://10.21.1.145:8000/api/vlm/status
 ros2 topic hz /fire_smoke/results
 ros2 topic echo /fire_smoke/prealert
 ros2 topic echo /alert/fire
+```
+
+动态行人/Nav2 创新点验证：
+
+```bash
+ros2 topic echo /dynamic_person_points --once
+ros2 topic echo /vlm/safety_event
 ```
 
 前端验证：浏览器打开 `http://10.21.1.145:8000` 任意页面。`level=high` 应出现顶部红色横幅、自动弹窗和 4 声警报音；`level=low` 只出现右下角黄色 toast。浏览器首次播放音频前需要用户点一下页面以解锁 AudioContext。
@@ -1151,6 +1210,8 @@ ROS2_SERVICE_VLM_ASK: str = "/vlm/ask"                           # VLM 手动触
 ROS2_TOPIC_FIRE_ALERT: str = "/alert/fire"                       # 火警二次确认结果（v13.0）
 ROS2_TOPIC_FIRE_PREALERT: str = "/fire_smoke/prealert"           # 火/烟一阶预警（v13.0）
 ROS2_TOPIC_FIRE_RESULTS: str = "/fire_smoke/results"             # 火/烟一阶检测结果（v13.0）
+ROS2_TOPIC_SAFETY_EVENT: str = "/vlm/safety_event"               # 动态行人安全事件（v14.0）
+ROS2_TOPIC_DYNAMIC_PERSON_POINTS: str = "/dynamic_person_points" # 动态行人障碍点云（v14.0）
 ```
 
 ### 前端配置（`frontend/src/config/index.ts`）
@@ -1185,6 +1246,8 @@ export const LIDAR_Z_MAX = 2.0         // 高度过滤上限
 | `/fire_smoke/results` | `std_msgs/String` | 火/烟一阶 YOLOv5 检测结果 JSON（v13.0 新增，调试用） |
 | `/fire_smoke/prealert` | `std_msgs/String` | 火/烟连续命中后的预警 JSON，供 VLM 二次确认消费（v13.0 新增） |
 | `/alert/fire` | `std_msgs/String` | VLM 二次确认后的火警 JSON，后端转发为 WS `fire_alert`（v13.0 新增） |
+| `/dynamic_person_points` | `sensor_msgs/PointCloud2` | 动态行人障碍点云，供 Nav2 costmap 与前端红点显示使用（v14.0 新增） |
+| `/vlm/safety_event` | `std_msgs/String` | 动态行人安全事件 JSON，action 为 clear/reroute/stop（v14.0 新增） |
 
 发布 Topic：
 
@@ -1199,6 +1262,7 @@ export const LIDAR_Z_MAX = 2.0         // 高度过滤上限
 | Service | 类型 | 说明 |
 |---------|------|------|
 | `/vlm/ask` | `std_srvs/srv/Trigger` | 手动触发一次 VLM 场景分析（v12.0 新增） |
+| `/vlm_scene_node/set_parameters` | `rcl_interfaces/srv/SetParameters` | 写入 `provider`、`next_user_prompt` 等运行时参数，v14.0 用于 provider 热切换 |
 
 ### STM32 桥接节点（`czybot_navigation2`）
 
@@ -1223,7 +1287,7 @@ export const LIDAR_Z_MAX = 2.0         // 高度过滤上限
 }
 ```
 
-支持的 Topic：`system`, `robot_status`, `lidar`, `imu`, `slam_map`, `video_rgb`, `video_depth`, `video_annotated`, `detection_results`, `vlm_description`, `vlm_status`, `fire_alert`, `navigation`, `log`, `heartbeat`, `odom`
+支持的 Topic：`system`, `robot_status`, `lidar`, `imu`, `slam_map`, `video_rgb`, `video_depth`, `video_annotated`, `detection_results`, `vlm_description`, `vlm_status`, `fire_alert`, `safety_event`, `dynamic_person_points`, `navigation`, `log`, `heartbeat`, `odom`
 
 > **v6.0 视频推送**：
 > - `video_rgb`：纯 RGB 原图，自动选择最佳数据源（ros2 → mock），前端通过 `source` 字段区分
@@ -1231,11 +1295,15 @@ export const LIDAR_Z_MAX = 2.0         // 高度过滤上限
 > - `detection_results`：YOLO 检测结果 JSON，10Hz 推送
 >
 > **v12.0 VLM 推送**：
-> - `vlm_status`：VLM 节点 ready/provider/last_error/elapsed_ms 等状态，默认自动订阅
+> - `vlm_status`：VLM 节点 ready/provider/last_error/elapsed_ms 等状态，默认自动订阅；v14.0 provider 切换会出现 `type=provider_switched`
 > - `vlm_description`：场景自然语言描述，前端视频监控页按需订阅并保存最近历史
 >
 > **v13.0 火警推送**：
 > - `fire_alert`：`/alert/fire` 二次确认结果，属于安全关键 topic，后端 `DEFAULT_TOPICS` 与前端 `AUTO_SUBSCRIBED_TOPICS` 默认订阅，任意页面都可触发全局 Overlay。
+>
+> **v14.0 动态行人/Nav2 推送**：
+> - `safety_event`：`/vlm/safety_event` 结构化安全动作，`action=stop` 触发全局横幅/弹窗，`action=reroute` 触发 toast 与导航页重规划计数。
+> - `dynamic_person_points`：`/dynamic_person_points` 解析后的轻量点集，导航页在机器人 3m 范围内绘制红点。
 
 ## 网络配置
 

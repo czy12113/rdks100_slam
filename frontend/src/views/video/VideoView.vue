@@ -157,6 +157,19 @@
           <div class="card-header">
             <span class="card-title">
               <el-icon><MagicStick /></el-icon> 场景理解
+              <!-- 本地 / 云端 模式徽标（来自 useVlmProvider） -->
+              <span
+                class="mode-badge"
+                :style="{
+                  color: modeColor,
+                  borderColor: modeColor,
+                  background: modeColor + '22',
+                }"
+                :title="isLocal ? '本地推理 · 无需公网' : '云端推理 · 依赖公网'"
+              >
+                <span class="mode-dot" :style="{ background: modeColor }" />
+                {{ modeLabel }}
+              </span>
               <span class="vlm-provider" v-if="vlmProvider">
                 {{ vlmProvider }} / {{ vlmModel }}
               </span>
@@ -167,6 +180,14 @@
               </el-tag>
               <el-tag size="small" type="warning" v-if="vlmLastMs > 0">
                 {{ vlmLastMs }} ms
+              </el-tag>
+              <el-tag
+                size="small"
+                :type="isLocal ? 'success' : 'primary'"
+                effect="plain"
+                v-if="avgLatencyMs != null && avgLatencyMs > 0"
+              >
+                均 {{ avgLatencyMs!.toFixed(0) }} ms
               </el-tag>
               <el-button
                 size="small"
@@ -252,6 +273,15 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { wsClient } from '@/api/websocket'
 import { vlmApi } from '@/api/http'
 import { ElMessage } from 'element-plus'
+import { useVlmProvider } from '@/composables/useVlmProvider'
+
+// ── 本地 / 云端 模式（来自 useVlmProvider 单例）─────────────────────────────
+const {
+  isLocal,
+  modeLabel,
+  modeColor,
+  avgLatencyMs,
+} = useVlmProvider()
 
 // ── 图像流状态 ────────────────────────────────────────────────────────────────
 const rgbSrc      = ref('')
@@ -631,6 +661,35 @@ onUnmounted(() => {
     color: var(--color-text-muted); margin-left: 8px; font-weight: normal;
   }
   .actions { display: flex; align-items: center; gap: 6px; }
+
+  // ── 本地/云端 模式徽标 ──────────────────────────────────────────────────
+  .mode-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-left: 8px;
+    padding: 1px 8px;
+    border-radius: 10px;
+    border: 1px solid;
+    font-size: 11px;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    line-height: 18px;
+    letter-spacing: 0.3px;
+
+    .mode-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      box-shadow: 0 0 6px currentColor;
+      animation: mode-dot-pulse 1.4s ease-in-out infinite;
+    }
+  }
+}
+
+@keyframes mode-dot-pulse {
+  0%, 100% { opacity: 1;   transform: scale(1); }
+  50%      { opacity: 0.5; transform: scale(0.85); }
 }
 
 .vlm-latest {

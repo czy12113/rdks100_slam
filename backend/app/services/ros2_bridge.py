@@ -18,6 +18,8 @@ from app.core.config import (
     ROS2_TOPIC_SLAM_POSE,
     ROS2_TOPIC_VLM_DESCRIPTION, ROS2_TOPIC_VLM_STATUS, ROS2_SERVICE_VLM_ASK,
     ROS2_TOPIC_FIRE_ALERT, ROS2_TOPIC_FIRE_PREALERT,
+    # ── 创新点：动态行人 + 安全事件 ─────────────────────────────
+    ROS2_TOPIC_SAFETY_EVENT, ROS2_TOPIC_DYNAMIC_PERSON_POINTS,
     ROS2_SERVICE_SAVE_MAP, ROS2_SERVICE_LOAD_MAP,
     ROS2_SERVICE_START_SLAM, ROS2_SERVICE_STOP_SLAM,
     ROBOT_MAX_LINEAR_VEL, ROBOT_MAX_ANGULAR_VEL,
@@ -324,6 +326,42 @@ class ROS2Bridge:
             logger.info("[ROS2] 已订阅 fire_prealert → %s", ROS2_TOPIC_FIRE_PREALERT)
         except Exception as e:
             logger.error("[ROS2] 订阅 fire_prealert 失败: %s", e)
+
+        # ── 安全事件（dynamic_person_obstacle_node → /vlm/safety_event）──────
+        # 创新点核心 topic：本地 VLM + Nav2 联合决策后每次动作变化时发一次。
+        # payload 是 JSON，格式见 dynamic_person_obstacle_node.py 中
+        # _publish_safety_event() 定义。前端订阅它做弹窗、图标闪烁。
+        try:
+            from std_msgs.msg import String
+            sub = self._node.create_subscription(
+                String, ROS2_TOPIC_SAFETY_EVENT,
+                lambda msg: self._dispatch("safety_event", self._parse_safety_event(msg)), qos_reliable
+            )
+            self._subscribers["safety_event"] = sub
+            logger.info("[ROS2] 已订阅 safety_event → %s", ROS2_TOPIC_SAFETY_EVENT)
+        except Exception as e:
+            logger.error("[ROS2] 订阅 safety_event 失败: %s", e)
+
+        # ── 动态行人点云（dynamic_person_obstacle_node → /dynamic_person_points）──
+        # PointCloud2 供 Nav2 costmap 使用（本节点也订阅），本 bridge 把其中
+        # 少量代表点提取出来推给前端，让 NavigationView 在地图上叠加红点。
+        try:
+            from sensor_msgs.msg import PointCloud2
+            sub = self._node.create_subscription(
+                PointCloud2, ROS2_TOPIC_DYNAMIC_PERSON_POINTS,
+                lambda msg: self._dispatch(
+                    "dynamic_person_points",
+                    self._parse_dynamic_person_points(msg),
+                ),
+                qos_sensor,
+            )
+            self._subscribers["dynamic_person_points"] = sub
+            logger.info(
+                "[ROS2] 已订阅 dynamic_person_points → %s (BEST_EFFORT depth=1)",
+                ROS2_TOPIC_DYNAMIC_PERSON_POINTS,
+            )
+        except Exception as e:
+            logger.error("[ROS2] 订阅 dynamic_person_points 失败: %s", e)
 
         logger.info("[ROS2] 订阅者创建完成，成功: %s", list(self._subscribers.keys()))
 
@@ -798,6 +836,79 @@ class ROS2Bridge:
             logger.error("[ROS2] 解析 vlm_status 失败: %s", e)
             return {}
 
+    def _parse_safety_event(self, msg) -> dict:
+        """
+        解析 /vlm/safety_event（std_msgs/String，JSON 格式）。
+        dynamic_person_obstacle_node 发布格式：
+          {
+            "timestamp":  float,
+            "action":     "clear" | "reroute" | "stop",
+            "prev_action": "...",             # 上一状态（用于前端只弹窗关键变化）
+            "person_count": int,
+            "min_distance_m": float,
+            "reason":     "中文一句话",
+            "vlm_summary": {                  # /vlm/scene_description 最近一条摘要
+              "provider": "internvl_local" | "qwen_vl" | ...,
+              "backend":  "hf" | "rule_based" | "cloud",
+              "description": "..."
+            },
+            "replan_count": int,
+            "estop_triggered": bool
+          }
+        """
+        import json as _json
+        try:
+            return _json.loads(msg.data)
+        except Exception as e:
+            logger.error("[ROS2] 解析 safety_event 失败: %s", e)
+            return {}
+
+    def _parse_dynamic_person_points(self, msg) -> dict:
+        """
+        解析 /dynamic_person_points（sensor_msgs/PointCloud2）。
+        dynamic_person_obstacle_node 每人产生 points_per_person (默认 12) 个点
+        沿着 bbox 中心距离方向的一段短棒；本 parser 只把 x/y 提取出来，
+        供 NavigationView 在地图上画少量红点即可，不必传所有点。
+        """
+        import struct
+        import math
+
+        try:
+            field_offsets = {f.name: f.offset for f in msg.fields}
+            x_off = field_offsets.get("x", 0)
+            y_off = field_offsets.get("y", 4)
+            point_step = msg.point_step
+            raw = bytes(msg.data)
+            total = msg.width * msg.height
+
+            # 限个数：前端最多显示 60 个红点，够表达 5 个人
+            MAX_KEEP = 60
+            step = max(1, total // MAX_KEEP)
+
+            points = []
+            for i in range(0, total, step):
+                base = i * point_step
+                if base + point_step > len(raw):
+                    break
+                try:
+                    x = struct.unpack_from("<f", raw, base + x_off)[0]
+                    y = struct.unpack_from("<f", raw, base + y_off)[0]
+                except struct.error:
+                    continue
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    continue
+                points.append([round(x, 3), round(y, 3)])
+
+            return {
+                "timestamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+                "frame_id": msg.header.frame_id,
+                "count": len(points),
+                "points": points,
+            }
+        except Exception as e:
+            logger.error("[ROS2] 解析 dynamic_person_points 失败: %s", e)
+            return {"count": 0, "points": []}
+
     # -------------------------------------------------------------------------
     # 控制指令发布
     # -------------------------------------------------------------------------
@@ -893,10 +1004,13 @@ class ROS2Bridge:
             if prompt:
                 try:
                     # 通过设置一个共享的 ROS2 参数（vlm_node 每次推理前读取此参数后清空）
+                    # ⚠️ 注意：vlm_node 在 __init__ 里 super().__init__("vlm_scene_node")，
+                    # ROS2 参数服务是按 ROS 节点名而非包名/可执行名注册的，因此这里
+                    # 必须用 /vlm_scene_node/set_parameters 而不是 /vlm_node/set_parameters。
                     from rcl_interfaces.srv import SetParameters
                     from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
                     param_client = self._node.create_client(
-                        SetParameters, "/vlm_node/set_parameters"
+                        SetParameters, "/vlm_scene_node/set_parameters"
                     )
                     if param_client.wait_for_service(timeout_sec=2.0):
                         req = SetParameters.Request()
